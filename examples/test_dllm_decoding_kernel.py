@@ -5,7 +5,7 @@ from tqdm import tqdm
 from einops import rearrange
 from torch.nn.functional import scaled_dot_product_attention
 
-from diffuserve.legacy.layers.attention.ops import diffusion_lm_parallel_flash_decoding, diffusion_lm_flash_decoding
+from diffulex.legacy.layers.attention.ops import diffusion_lm_parallel_flash_decoding, diffusion_lm_flash_decoding
 
 
 if __name__ == "__main__":

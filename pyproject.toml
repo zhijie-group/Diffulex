@@ -1,5 +1,5 @@
 [project]
-name = "DiffuServe"
+name = "Diffulex"
 version = "0.0.1"
 authors = [
     { name = "Drew Jin (Yijie Jin)", email = "drewjin0827@gmail.com"},
@@ -7,7 +7,7 @@ authors = [
 maintainers = [
     { name = "DENG Lab @ SJTU" }
 ]
-description = "Diffusion LLM serving engine supporting multiple variants of dLLM decoding strategies with high efficiency and low latency."
+description = "Flexible Diffusion LLM serving engine supporting multiple variants of dLLM decoding strategies with high efficiency and low latency."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }

@@ -2,7 +2,7 @@
     <img src="imgs/logo_lr.png" width="300">
 </p>
 
-# D2fEngine
+# Diffulex: Flexible Diffusion LLM Inference Engine
 
 vLLM implementation for Diffusion LLMs, D2F is integrated as the core inference strategy, while also support training-free strategies like Fast-dLLM.
 

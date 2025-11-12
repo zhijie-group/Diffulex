@@ -4,7 +4,7 @@ from typing import List
 from dataclasses import dataclass
 
 from mimic_data.mimic_slot_mapping import slot_mapping
-from diffuserve.legacy.layers.attention.ops import store_kvcache_unified_layout, load_kvcache, CHECK_LOADING
+from diffulex.legacy.layers.attention.ops import store_kvcache_unified_layout, load_kvcache, CHECK_LOADING
 
 @dataclass
 class MimicSequenceForDiffusionLM:
