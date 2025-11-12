@@ -1,6 +1,6 @@
 import torch
 
-from diffuserve.legacy.layers.attention.ops.triton_decode_attn_clm import causal_lm_decode_attention_fwd
+from diffulex.legacy.layers.attention.ops.triton_decode_attn_clm import causal_lm_decode_attention_fwd
 
 if __name__ == "__main__":
     torch.random.manual_seed(114514)

@@ -1,6 +1,6 @@
 import os
 
-from diffuserve.legacy import LLM, SamplingParams
+from diffulex.legacy import LLM, SamplingParams
 from viztracer import VizTracer
 
 
