@@ -3,16 +3,12 @@ from __future__ import annotations
 from diffulex.config import Config
 from diffulex.engine.scheduler import AutoScheduler, SchedulerBase
 from diffulex.engine.sequence import SequenceBase, SequenceStatus
-from .sequence import D2FSequence
+from .sequence import BlockDiffusionSequence
 from diffulex.layer.sampler import SampleOutputForDiffusionLM
 
 
-@AutoScheduler.register(
-    "d2f",
-    aliases=("diffusion_lm",),
-    is_default=True,
-)
-class D2FScheduler(SchedulerBase):
+@AutoScheduler.register("block_diffusion", is_default=True)
+class BlockDiffusionScheduler(SchedulerBase):
     def __init__(self, config: Config):
         super().__init__(config)
         self.diffusion_block_size = config.diffusion_block_size
@@ -20,7 +16,7 @@ class D2FScheduler(SchedulerBase):
     def is_finished(self) -> bool:
         return not self.waiting and not self.running
 
-    def add(self, seq: D2FSequence) -> None:
+    def add(self, seq: BlockDiffusionSequence) -> None:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[SequenceBase], bool]:
@@ -81,20 +77,20 @@ class D2FScheduler(SchedulerBase):
                     f"can_append={can_append}"
                 )
             raise RuntimeError(
-                "D2FScheduler: unable to schedule any sequence in decode; "
+                "BlockDiffusionScheduler: unable to schedule any sequence in decode; "
                 f"state={diag}; details={' | '.join(details)}"
             )
         self.running.extendleft(reversed(scheduled))
         return scheduled, False
 
-    def preempt(self, seq: D2FSequence) -> None:
+    def preempt(self, seq: BlockDiffusionSequence) -> None:
         seq.status = SequenceStatus.WAITING
         self.block_manager.free(seq)
         self.waiting.appendleft(seq)
 
     def postprocess(
         self,
-        seqs: list[D2FSequence],
+        seqs: list[BlockDiffusionSequence],
         sample_output: SampleOutputForDiffusionLM,
     ) -> dict[int, int]:
         n_diff_steps: dict[int, int] = {}

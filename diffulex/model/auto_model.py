@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from diffulex.legacy.config import Config
-from diffulex.legacy.utils.loader import load_model
-from diffulex.legacy.models.dream import DreamForDiffusionLM
-from diffulex.legacy.models.llada import LLaDAForDiffusionLM
+from diffulex.config import Config
+from diffulex.utils.loader import load_model
+
 
 _NOT_PROVIDED = object()
 RegistryEntry = tuple[Callable[[Any], Any] | type | None, bool]

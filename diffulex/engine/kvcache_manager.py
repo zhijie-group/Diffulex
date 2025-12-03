@@ -119,7 +119,7 @@ class AutoKVCacheManager(DiffulexStrategyRegistry):
     def from_config(cls, config: Config) -> KVCacheManagerBase:
         cls._MODULE_MAPPING: dict[str, KVCacheManagerFactory]
         candidates: list[str] = []
-        for attr in ("decoding_strategy", "model_type"):
+        for attr in ("decoding_strategy",):
             value = getattr(config, attr, None)
             if isinstance(value, str) and value:
                 candidates.append(value)
@@ -133,6 +133,5 @@ class AutoKVCacheManager(DiffulexStrategyRegistry):
         available = ", ".join(cls.available_modules()) or "<none>"
         raise ValueError(
             "No block manager registered for decoding_strategy="
-            f"'{getattr(config, 'decoding_strategy', None)}' or model_type="
-            f"'{getattr(config, 'model_type', None)}'. Available block managers: {available}."
+            f"'{getattr(config, 'decoding_strategy', None)}'. Available block managers: {available}."
         )

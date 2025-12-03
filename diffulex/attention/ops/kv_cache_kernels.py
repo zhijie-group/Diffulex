@@ -3,11 +3,8 @@ import triton
 
 import triton.language as tl
 
-from typing import Tuple
-from einops import rearrange
+from typing import Any
 
-from diffulex.utils.context import ContextForDiffusionLM 
-from diffulex.strategy.d2f.sequence import D2FSequence
 
 @triton.jit
 def store_kvcache_kernel_causal_lm(
@@ -108,49 +105,32 @@ def store_kvcache_kernel_diffusion_lm_distinct(
 
 def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor, 
                                   k_cache: torch.Tensor, v_cache: torch.Tensor, 
-                                  slot_mapping: torch.Tensor, model_type: str = 'causal_lm',
-                                  context: ContextForDiffusionLM = None) -> None:
+                                  slot_mapping: torch.Tensor,
+                                  context = None) -> None:
+    # k_cache: [num_blks, h, hdim // x, blk_sz, x]
+    # v_cache: [num_blks, h, hdim, blk_sz]
+    NBlks, NHeads, HDim_x, Blk_sz, x = k_cache.shape
+    HDim = HDim_x * x
+    N = key.shape[0]
+    assert HDim == key.shape[-1] and NHeads == key.shape[1]
+    assert N == slot_mapping.numel()
     
-    if model_type == 'causal_lm':
-        # k_cache: [num_blks, blk_sz, h, hdim]
-        # v_cache: [num_blks, blk_sz, h, hdim]
-        N, num_heads, head_dim = key.shape
-        D = num_heads * head_dim
-        assert key.stride(-1) == 1 and value.stride(-1) == 1
-        assert key.stride(1) == head_dim and value.stride(1) == head_dim
-        assert k_cache.stride(1) == D and v_cache.stride(1) == D
-        assert N == slot_mapping.numel()
-        store_kvcache_kernel_causal_lm[(N,)](
-            key, key.stride(0),
-            value, value.stride(0),
-            k_cache, v_cache, slot_mapping, D
-        )
-    else:
-        # TODO: implement diffusion lm kv cache store
-        # k_cache: [num_blks, h, hdim // x, blk_sz, x]
-        # v_cache: [num_blks, h, hdim, blk_sz]
-        NBlks, NHeads, HDim_x, Blk_sz, x = k_cache.shape
-        HDim = HDim_x * x
-        N = key.shape[0]
-        assert HDim == key.shape[-1] and NHeads == key.shape[1]
-        assert N == slot_mapping.numel()
-        
-        GRID = (N, )
-        store_kvcache_kernel_diffusion_lm_distinct[GRID](
-            key, value,
-            k_cache, v_cache,
-            slot_mapping,
-            key.stride(0), value.stride(0), 
-            *k_cache.stride(), *v_cache.stride(),
-            NHeads, HDim, Blk_sz,
-            x, HDim * NHeads
-        )
+    GRID = (N, )
+    store_kvcache_kernel_diffusion_lm_distinct[GRID](
+        key, value,
+        k_cache, v_cache,
+        slot_mapping,
+        key.stride(0), value.stride(0), 
+        *k_cache.stride(), *v_cache.stride(),
+        NHeads, HDim, Blk_sz,
+        x, HDim * NHeads
+    )
 
 
 def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor, 
                                  k_cache: torch.Tensor, v_cache: torch.Tensor, 
-                                 slot_mapping: torch.Tensor, model_type: str = 'causal_lm', 
-                                 context: ContextForDiffusionLM = None) -> None:
+                                 slot_mapping: torch.Tensor,
+                                 context: Any = None) -> None:
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
@@ -158,18 +138,11 @@ def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor,
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert N == slot_mapping.numel(), f"`N`: {N}, `slot_mapping.numel()`: {slot_mapping.numel()}"
 
-    if model_type == 'causal_lm':
-        store_kvcache_kernel_causal_lm[(N,)](
-            key, key.stride(0),
-            value, value.stride(0),
-            k_cache, v_cache, slot_mapping, D
-        )
-    elif model_type == 'diffusion_lm':
-        store_kvcache_kernel_diffusion_lm[(N,)](
-            key, key.stride(0),
-            value, value.stride(0),
-            k_cache, v_cache, slot_mapping, D
-        )
+    store_kvcache_kernel_diffusion_lm[(N,)](
+        key, key.stride(0),
+        value, value.stride(0),
+        k_cache, v_cache, slot_mapping, D
+    )
         
 
 @triton.jit
@@ -276,8 +249,8 @@ def load_kvcache_kernel_kv(k_cache_ptr, v_cache_ptr,
 
 
 def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
-                 context: ContextForDiffusionLM,
-                 k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                 context: Any,
+                 k_new: torch.Tensor, v_new: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert k_cache.shape == v_cache.shape
     assert k_new.shape == v_new.shape
     N_BLOCKS, PAGE_SIZE, H_KV, HEAD_DIM = k_cache.shape
@@ -329,7 +302,7 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
 
 def CHECK_STORING(k_cache: torch.Tensor, v_cache: torch.Tensor,
                   k: torch.Tensor, v: torch.Tensor,
-                  context: ContextForDiffusionLM) -> None:
+                  context) -> None:
     k_list, v_list = [torch.split(tensor, context.seq_lens, dim=0) for tensor in (k, v)]
     for seq_idx, seq in enumerate(context.seqs):
         cached_num_tokens = seq.cached_num_tokens
@@ -365,7 +338,7 @@ def CHECK_STORING(k_cache: torch.Tensor, v_cache: torch.Tensor,
 def CHECK_LOADING(k_comb: torch.Tensor, v_comb: torch.Tensor,
                   k_new: torch.Tensor, v_new: torch.Tensor,
                   k_cache: torch.Tensor, v_cache: torch.Tensor,
-                  context: ContextForDiffusionLM) -> Tuple[torch.Tensor, torch.Tensor]:
+                  context: Any) -> tuple[torch.Tensor, torch.Tensor]:
     try:
         k_list, v_list = [torch.split(tensor, context.seq_lens, dim=0) for tensor in (k_new, v_new)]
         cat_k_list = []

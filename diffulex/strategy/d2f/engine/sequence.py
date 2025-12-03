@@ -121,11 +121,7 @@ class D2FDiffusionBlock:
         self.seq.new_tokens += 1
 
 
-@AutoSequence.register(
-    "d2f",
-    aliases=("diffusion_lm",),
-    is_default=True,
-)
+@AutoSequence.register("d2f", is_default=True)
 class D2FSequence(SequenceBase):
     """Sequence implementation tailored for diffusion-based decoding."""
 

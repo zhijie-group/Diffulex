@@ -11,7 +11,7 @@ from multiprocessing.shared_memory import SharedMemory
 from diffulex.config import Config
 from diffulex.layer.sampler import AutoSampler
 from diffulex.engine.sequence import SequenceBase
-from diffulex.model.auto_model import AutoModelForDiffusionLM
+from diffulex.model import AutoModelForDiffusionLM
 from diffulex.engine.strategy_registry import DiffulexStrategyRegistry
 
 
@@ -19,7 +19,6 @@ class ModelRunnerBase(ABC):
     """Base class for model runners supporting different model types."""
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
-        self.model_type = config.model_type
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
@@ -57,7 +56,7 @@ class ModelRunnerBase(ABC):
                     shm.unlink()
                 except FileNotFoundError:
                     pass
-                shm_size = 2**25 if self.model_type == "diffusion_lm" else 2**20
+                shm_size = 2**25
                 self.shm = SharedMemory(name=config.shm_name, create=True, size=shm_size)
                 dist.barrier()
             else:
@@ -187,7 +186,7 @@ class AutoModelRunner(DiffulexStrategyRegistry):
     def from_config(cls, config: Config, rank: int, event: Event | list[Event]):
         cls._MODULE_MAPPING: dict[str, RunnerFactory]
         candidates: list[str] = []
-        for attr in ("decoding_strategy", "model_type"):
+        for attr in ("decoding_strategy",):
             value = getattr(config, attr, None)
             if isinstance(value, str) and value:
                 candidates.append(value)
@@ -201,6 +200,5 @@ class AutoModelRunner(DiffulexStrategyRegistry):
         available = ", ".join(cls.available_modules()) or "<none>"
         raise ValueError(
             "No model runner registered for decoding_strategy="
-            f"'{getattr(config, 'decoding_strategy', None)}' or model_type="
-            f"'{getattr(config, 'model_type', None)}'. Available runners: {available}."
+            f"'{getattr(config, 'decoding_strategy', None)}'. Available runners: {available}."
         )

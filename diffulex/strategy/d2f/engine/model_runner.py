@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import list
+
 from multiprocessing.synchronize import Event
 
 import torch
@@ -14,11 +14,7 @@ from diffulex.engine.model_runner import AutoModelRunner, ModelRunnerBase
 from diffulex.strategy.d2f.attention.metadata import fetch_d2f_attn_metadata, set_d2f_attn_metadata, reset_d2f_attn_metadata
 
 
-@AutoModelRunner.register(
-    "d2f",
-    aliases=("diffusion_lm",),
-    is_default=True,
-)
+@AutoModelRunner.register("d2f", is_default=True)
 class D2FModelRunner(ModelRunnerBase):
     """Reference implementation of D2F decoding strategy."""
 

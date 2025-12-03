@@ -200,7 +200,7 @@ class LLaDAModel(nn.Module):
         )
         
         blocks = [LLaDABlock(config) for _ in range(config.n_layers)]
-        self.transformer.update({"blocks": nn.Modulelist(blocks)})
+        self.transformer.update({"blocks": nn.ModuleList(blocks)})
         
         if not (self.config.alibi or self.config.rope):
             self.transformer.update(
@@ -245,7 +245,7 @@ class LLaDAForDiffusionLM(nn.Module):
     ) -> None:
         super().__init__()
         self.model = LLaDAModel(config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, model_type='diffusion_lm')
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if getattr(config, 'weight_tying', False):
             self.lm_head.weight.data = self.model.transformer.wte.weight.data
 

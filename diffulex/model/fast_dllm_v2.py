@@ -189,7 +189,7 @@ class FastdLLMV2Model(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.Modulelist([FastdLLMV2DecoderLayer(config) 
+        self.layers = nn.ModuleList([FastdLLMV2DecoderLayer(config) 
                                      for _ in range(config.num_hidden_layers)])
         self.norm = FastdLLMV2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -218,7 +218,7 @@ class FastdLLMV2ForDiffusionLM(nn.Module):
     ) -> None:
         super().__init__()
         self.model = FastdLLMV2Model(config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, model_type='diffusion_lm')
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if getattr(config, 'tie_word_embeddings', False):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 

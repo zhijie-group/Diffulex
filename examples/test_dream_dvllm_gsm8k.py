@@ -9,7 +9,7 @@ from datasets import load_dataset
 from viztracer import VizTracer
 from transformers import AutoTokenizer
 
-from diffulex.legacy import LLM, SamplingParams
+from diffulex import Diffulex, SamplingParams
 
 
 def summarize_profiling(csv_path: str) -> dict:
@@ -42,15 +42,14 @@ Q: There are 15 trees in the grove. Grove workers will plant trees in the grove 
 
 
 if __name__ == "__main__":
-    model = "ckpt/Dream-v0-Base-7B"
-    LLM = LLM(
+    model = "/data1/ckpts/Dream-org/Dream-v0-Base-7B"
+    LLM = Diffulex(
         model,
-        lora_path="ckpt/D2F_Dream_Base_7B_Lora",
+        lora_path="/data1/ckpts/SJTU-Deng-Lab/D2F_Dream_Base_7B_Lora",
         use_lora=True,
         model_name="dream", 
-        model_type="diffusion_lm",
         enforce_eager=True, 
-        data_parallel_size=8,
+        data_parallel_size=1,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.25,
         max_num_batched_tokens=2048,

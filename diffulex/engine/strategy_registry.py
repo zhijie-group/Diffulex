@@ -9,8 +9,12 @@ _NOT_PROVIDED = object()
 class DiffulexStrategyRegistry:
     """Registry-driven factory for module implementations."""
     
-    _MODULE_MAPPING: dict[str, object] = {}
-    _DEFAULT_KEY = "__default__" 
+    _DEFAULT_KEY = "__default__"
+    
+    def __init_subclass__(cls, **kwargs):
+        """Initialize a separate _MODULE_MAPPING for each subclass."""
+        super().__init_subclass__(**kwargs)
+        cls._MODULE_MAPPING: dict[str, object] = {} 
     
     @classmethod
     def register(
@@ -43,8 +47,22 @@ class DiffulexStrategyRegistry:
 
     @classmethod
     def _register(cls, key: str, factory: object, *, exist_ok: bool) -> None:
-        if not exist_ok and key in cls._MODULE_MAPPING and cls._MODULE_MAPPING[key] is not factory:
-            raise ValueError(f"Module '{key}: {fetch_factory_name(factory)}' is already registered.")
+        # If the same factory is already registered, silently skip (idempotent registration)
+        if key in cls._MODULE_MAPPING:
+            existing = cls._MODULE_MAPPING[key]
+            # Check if it's the same factory object
+            if existing is factory:
+                return  # Same factory already registered, no-op
+            # Check if it's the same class by name and module (handles module reload cases)
+            existing_name = fetch_factory_name(existing)
+            new_name = fetch_factory_name(factory)
+            if existing_name == new_name:
+                return  # Same class already registered (possibly from module reload), no-op
+            if not exist_ok:
+                raise ValueError(
+                    f"Module '{key}: {new_name}' is already registered as '{existing_name}'. "
+                    f"Use exist_ok=True to override."
+                )
         cls._MODULE_MAPPING[key] = factory
     
     @classmethod

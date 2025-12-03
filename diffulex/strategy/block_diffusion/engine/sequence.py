@@ -10,16 +10,16 @@ from diffulex.engine.sequence import AutoSequence, SequenceBase
 from diffulex.sampling_params import SamplingParams
 
 
-class D2FDiffusionBlockStatus(Enum):
+class BlockDiffusionBlockStatus(Enum):
     ACTIVE = auto()
     TO_CACHE = auto()
     IN_CACHE = auto()
 
 
 @dataclass
-class D2FDiffusionBlock:
+class BlockDiffusionBlock:
     block_id: int = 0
-    status: D2FDiffusionBlockStatus = D2FDiffusionBlockStatus.ACTIVE
+    status: BlockDiffusionBlockStatus = BlockDiffusionBlockStatus.ACTIVE
 
     global_start_id: int = 0
     global_end_id: int | None = None
@@ -33,9 +33,9 @@ class D2FDiffusionBlock:
     add_new_block_threshold: float = 0.1
     complete_threshold: float = 0.9
 
-    seq: "D2FSequence" | None = None
-    pre_block: "D2FDiffusionBlock" | None = None
-    suf_block: "D2FDiffusionBlock" | None = None
+    seq: "BlockDiffusionSequence" | None = None
+    pre_block: "BlockDiffusionBlock" | None = None
+    suf_block: "BlockDiffusionBlock" | None = None
 
     def __post_init__(self) -> None:
         self.global_end_id = self.global_start_id + self.size
@@ -58,15 +58,15 @@ class D2FDiffusionBlock:
 
     @property
     def is_active(self) -> bool:
-        return self.status == D2FDiffusionBlockStatus.ACTIVE
+        return self.status == BlockDiffusionBlockStatus.ACTIVE
 
     @property
     def is_in_cache(self) -> bool:
-        return self.status == D2FDiffusionBlockStatus.IN_CACHE
+        return self.status == BlockDiffusionBlockStatus.IN_CACHE
 
     @property
     def is_to_cache(self) -> bool:
-        return self.status == D2FDiffusionBlockStatus.TO_CACHE
+        return self.status == BlockDiffusionBlockStatus.TO_CACHE
 
     @property
     def pre_block_complete(self) -> bool:
@@ -106,11 +106,11 @@ class D2FDiffusionBlock:
 
     def to_cache(self) -> None:
         if self.available_to_cache and not self.is_in_cache:
-            self.status = D2FDiffusionBlockStatus.TO_CACHE
+            self.status = BlockDiffusionBlockStatus.TO_CACHE
 
     def in_cache(self) -> None:
         if self.is_to_cache:
-            self.status = D2FDiffusionBlockStatus.IN_CACHE
+            self.status = BlockDiffusionBlockStatus.IN_CACHE
 
     def modify_token(self, local_token_id: int, modified_to: int) -> None:
         if self.seq is None:
@@ -121,12 +121,8 @@ class D2FDiffusionBlock:
         self.seq.new_tokens += 1
 
 
-@AutoSequence.register(
-    "d2f",
-    aliases=("diffusion_lm",),
-    is_default=True,
-)
-class D2FSequence(SequenceBase):
+@AutoSequence.register("block_diffusion", is_default=True)
+class BlockDiffusionSequence(SequenceBase):
     """Sequence implementation tailored for diffusion-based decoding."""
 
     def __init__(
@@ -147,7 +143,7 @@ class D2FSequence(SequenceBase):
         self.diffusion_block_size = config.diffusion_block_size
         self.block_mask: torch.Tensor | None = None
         self.meet_eos = False
-        self.diffusion_blocks: list[D2FDiffusionBlock] = []
+        self.diffusion_blocks: list[BlockDiffusionBlock] = []
         self.n_steps = 0
         self.input_token_ids: list[int] = []
         self.input_num_tokens = 0
@@ -254,7 +250,7 @@ class D2FSequence(SequenceBase):
         self.diffusion_blocks = []
         pre_block = None
         for block_state in state["diffusion_blocks_state"]:
-            block = D2FDiffusionBlock(
+            block = BlockDiffusionBlock(
                 block_id=block_state["block_id"],
                 status=block_state["status"],
                 global_start_id=block_state["global_start_id"],
@@ -442,9 +438,9 @@ class D2FSequence(SequenceBase):
             self.input_num_prompt_tokens = self.num_prompt_tokens
             self.num_prompt_tokens += self.diffusion_block_size
             self.diffusion_blocks.append(
-                D2FDiffusionBlock(
+                BlockDiffusionBlock(
                     block_id=len(self.diffusion_blocks),
-                    status=D2FDiffusionBlockStatus.TO_CACHE,
+                    status=BlockDiffusionBlockStatus.TO_CACHE,
                     global_start_id=0,
                     mask_token_id=self.mask_token_id,
                     size=len(self.input_token_ids),
@@ -465,9 +461,9 @@ class D2FSequence(SequenceBase):
                 return
             added_num_tokens = min(self.diffusion_block_size, remaining)
             diffusion_seq = [self.mask_token_id] * added_num_tokens
-            current_block = D2FDiffusionBlock(
+            current_block = BlockDiffusionBlock(
                 block_id=len(self.diffusion_blocks),
-                status=D2FDiffusionBlockStatus.ACTIVE,
+                status=BlockDiffusionBlockStatus.ACTIVE,
                 global_start_id=self.num_tokens,
                 mask_token_id=self.mask_token_id,
                 size=added_num_tokens,

@@ -7,11 +7,7 @@ from .sequence import D2FSequence
 from diffulex.layer.sampler import SampleOutputForDiffusionLM
 
 
-@AutoScheduler.register(
-    "d2f",
-    aliases=("diffusion_lm",),
-    is_default=True,
-)
+@AutoScheduler.register("d2f", is_default=True)
 class D2FScheduler(SchedulerBase):
     def __init__(self, config: Config):
         super().__init__(config)

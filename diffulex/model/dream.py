@@ -83,7 +83,6 @@ class DreamAttention(nn.Module):
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
-            "diffusion_lm",  # Dream uses full attention
         )
 
     def forward(
@@ -189,7 +188,7 @@ class DreamModel(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.Modulelist([DreamDecoderLayer(config) 
+        self.layers = nn.ModuleList([DreamDecoderLayer(config) 
                                      for _ in range(config.num_hidden_layers)])
         self.norm = DreamRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -217,7 +216,7 @@ class DreamForDiffusionLM(nn.Module):
     ) -> None:
         super().__init__()
         self.model = DreamModel(config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, model_type='diffusion_lm')
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if getattr(config, 'tie_word_embeddings', False):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 

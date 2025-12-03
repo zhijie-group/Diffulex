@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.distributions as dists
 
 from dataclasses import dataclass
-from easydict import Easydict as edict
+from easydict import EasyDict as edict
 
 from diffulex.config import Config
 from diffulex.attention import fetch_attn_metadata

@@ -7,7 +7,7 @@ import faulthandler
 
 import multiprocessing as mp
 
-from typing import list, Any
+from typing import Any
 from multiprocessing.connection import wait as mp_wait
 
 from diffulex.config import Config
@@ -28,7 +28,6 @@ def _dp_child_entry(config: Config, dp_idx: int, local_devices: list[int], conn)
             model=config.model,
             lora_path=config.lora_path,
             model_name=config.model_name,
-            model_type=config.model_type,
             mask_token_id=config.mask_token_id,
             diffusion_block_size=config.diffusion_block_size,
             accept_threshold=config.accept_threshold,

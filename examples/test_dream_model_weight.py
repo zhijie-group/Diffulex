@@ -43,7 +43,6 @@ temp_config = Config(
     lora_path=lora_path,
     use_lora=True,
     model_name="dream", 
-    model_type="diffusion_lm",
     enforce_eager=True, 
     tensor_parallel_size=1,
     accept_threshold=0.95,

@@ -86,7 +86,7 @@ class AutoSequence(DiffulexStrategyRegistry):
     ) -> SequenceBase:
         cls._MODULE_MAPPING: dict[str, SequenceFactory]
         candidates: list[str] = []
-        for attr in ("decoding_strategy", "model_type"):
+        for attr in ("decoding_strategy",):
             value = getattr(config, attr, None)
             if isinstance(value, str) and value:
                 candidates.append(value)
@@ -100,6 +100,5 @@ class AutoSequence(DiffulexStrategyRegistry):
         available = ", ".join(cls.available_modules()) or "<none>"
         raise ValueError(
             "No sequence registered for decoding_strategy="
-            f"'{getattr(config, 'decoding_strategy', None)}' or model_type="
-            f"'{getattr(config, 'model_type', None)}'. Available sequences: {available}."
+            f"'{getattr(config, 'decoding_strategy', None)}'. Available sequences: {available}."
         )

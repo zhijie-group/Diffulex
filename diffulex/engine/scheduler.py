@@ -49,7 +49,7 @@ class AutoScheduler(DiffulexStrategyRegistry):
     def from_config(cls, config: Config) -> SchedulerBase:
         cls._MODULE_MAPPING: dict[str, SchedulerFactory]
         candidates: list[str] = []
-        for attr in ("decoding_strategy", "model_type"):
+        for attr in ("decoding_strategy",):
             value = getattr(config, attr, None)
             if isinstance(value, str) and value:
                 candidates.append(value)
@@ -63,6 +63,5 @@ class AutoScheduler(DiffulexStrategyRegistry):
         available = ", ".join(cls.available_modules()) or "<none>"
         raise ValueError(
             "No scheduler registered for decoding_strategy="
-            f"'{getattr(config, 'decoding_strategy', None)}' or model_type="
-            f"'{getattr(config, 'model_type', None)}'. Available schedulers: {available}."
+            f"'{getattr(config, 'decoding_strategy', None)}'. Available schedulers: {available}."
         )

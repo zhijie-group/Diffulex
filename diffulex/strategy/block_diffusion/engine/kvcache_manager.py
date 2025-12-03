@@ -6,23 +6,19 @@ from diffulex.config import Config
 from diffulex.engine.kvcache_manager import AutoKVCacheManager, KVCacheManagerBase
 
 if TYPE_CHECKING:
-    from .sequence import D2FSequence
+    from .sequence import BlockDiffusionSequence
 
 
-@AutoKVCacheManager.register(
-    "d2f",
-    aliases=("diffusion_lm",),
-    is_default=True,
-)
-class D2FKVCacheManager(KVCacheManagerBase):
+@AutoKVCacheManager.register("block_diffusion", is_default=True)
+class BlockDiffusionKVCacheManager(KVCacheManagerBase):
     def __init__(self, config: Config):
         super().__init__(config)
 
-    def can_append(self, seq: "D2FSequence") -> bool:
+    def can_append(self, seq: "BlockDiffusionSequence") -> bool:
         required = 1 if seq.cached_or_caching_num_tokens % self.block_size == 1 else 0
         return len(self.free_block_ids) >= required
 
-    def may_append(self, seq: "D2FSequence") -> None:
+    def may_append(self, seq: "BlockDiffusionSequence") -> None:
         if seq.cached_or_caching_num_tokens == 0:
             return
         block_table = seq.block_table

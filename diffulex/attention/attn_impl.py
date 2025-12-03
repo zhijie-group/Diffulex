@@ -3,7 +3,6 @@ import torch
 
 import torch.nn as nn
 
-from typing import list
 from functools import lru_cache, partial
 from einops import rearrange
 from torch.nn.attention.flex_attention import create_block_mask 
@@ -15,7 +14,7 @@ from diffulex.attention.ops import (
     store_kvcache_unified_layout, store_kvcache_distinct_layout, load_kvcache,
     CHECK_STORING, CHECK_LOADING, CHECK_ATTENTION
 )
-from diffulex.attention import AttnMetaDataBase, fetch_attn_metadata
+from diffulex.attention.metadata import AttnMetaDataBase, fetch_attn_metadata
 
 
 class Attention(nn.Module):
@@ -25,7 +24,6 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
-        model_type='causal_lm'
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -33,8 +31,6 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
-        self.causal = model_type == 'causal_lm'
-        self.model_type = model_type
         is_rtx_xx90 = lambda x: "4090" in x or "3090" in x
         kernel_options = {
             "BLOCK_M": 64,
@@ -61,27 +57,6 @@ class Attention(nn.Module):
             )
         return self._block_mask_cache[cache_key]
     
-    @lru_cache(maxsize=32)
-    def causal_lm_block_mask(self, cum_seq_lens: torch.Tensor, B: int, H: int, Q_LEN: int, KV_LEN: int, device: str):
-        cache_key = (B, H, Q_LEN, KV_LEN, device)
-        document_ids = torch.zeros((cum_seq_lens[-1],), dtype=torch.int32, device=device)
-        start_idx = 0
-        for doc_idx, seq_len in enumerate(cum_seq_lens[1:]):
-            end_idx = seq_len
-            document_ids[start_idx:end_idx] = doc_idx
-            start_idx = end_idx
-        
-        def _mask_mod(batch, head, token_q, token_kv):
-            causal_mask = token_q >= token_kv
-            document_mask = document_ids[token_q] == document_ids[token_kv]
-            return causal_mask & document_mask
-        
-        if cache_key not in self._block_mask_cache:
-            self._block_mask_cache[cache_key] = create_block_mask(
-                _mask_mod, B, H, Q_LEN, KV_LEN, device=device
-            )
-        return self._block_mask_cache[cache_key]
-
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 mask: list[torch.Tensor] | None = None) -> torch.Tensor:
         # Reshape
@@ -95,18 +70,16 @@ class Attention(nn.Module):
 
         # Fast Store KV cache
         if k_cache.numel() and v_cache.numel():
-            if not (self.model_type == 'diffusion_lm' and not attn_metadata.need_kv_cache_store):
+            if not (not attn_metadata.need_kv_cache_store):
                 store_kvcache = store_kvcache_unified_layout if is_unified_layout else store_kvcache_distinct_layout
-                store_kvcache(k, v, k_cache, v_cache, attn_metadata.slot_mapping, self.model_type, attn_metadata)
+                store_kvcache(k, v, k_cache, v_cache, attn_metadata.slot_mapping, attn_metadata)
                 # CHECK_STORING(k_cache, v_cache, k, v, context)
 
         transpose_fn = lambda x: rearrange(x, 's h d -> 1 h s d').contiguous()
         # Prefill / Decode logic TODO: Replace the Flex Attention Prefilling
         if attn_metadata.is_prefill:
             # Block PK
-            if attn_metadata.block_tables is not None and self.model_type == 'causal_lm':
-                k, v = k_cache, v_cache
-            elif attn_metadata.block_tables is not None and self.model_type == 'diffusion_lm':
+            if attn_metadata.block_tables is not None:
                 # TODO: Implement Prefix Caching
                 pass
 
@@ -114,9 +87,7 @@ class Attention(nn.Module):
             q_t, k_t, v_t = [transpose_fn(t) for t in (q, k, v)]
 
             B, H, S, _ = q_t.shape
-            block_mask_fn = self.causal_lm_block_mask if self.model_type == 'causal_lm' else self.dllm_block_mask
-            input_obj = attn_metadata.cu_seqlens_q if self.model_type == 'causal_lm' else attn_metadata.block_mask
-            block_mask = block_mask_fn(input_obj, B, H, S, S, str(q.device))
+            block_mask = self.dllm_block_mask(attn_metadata.block_mask, B, H, S, S, str(q.device))
             o = self.attention(q_t, k_t, v_t, block_mask=block_mask)
         else:
             config = attn_metadata.seqs[0].config

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, list
+from typing import TYPE_CHECKING
 
 from diffulex.config import Config
 from diffulex.engine.kvcache_manager import AutoKVCacheManager, KVCacheManagerBase
@@ -9,11 +9,7 @@ if TYPE_CHECKING:
     from .sequence import D2FSequence
 
 
-@AutoKVCacheManager.register(
-    "d2f",
-    aliases=("diffusion_lm",),
-    is_default=True,
-)
+@AutoKVCacheManager.register("d2f", is_default=True)
 class D2FKVCacheManager(KVCacheManagerBase):
     def __init__(self, config: Config):
         super().__init__(config)
