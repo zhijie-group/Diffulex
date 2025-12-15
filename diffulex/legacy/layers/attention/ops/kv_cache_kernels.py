@@ -8,6 +8,12 @@ from einops import rearrange
 
 from diffulex.legacy.utils.context import ContextForDiffusionLM 
 from diffulex.legacy.engine.sequence import SequenceForDiffusionLM
+from diffulex.utils.kv_cache_dtype import (
+    KvCacheDType,
+    ensure_scale_tensor,
+    parse_kv_cache_dtype,
+    view_fp8_cache,
+)
 
 @triton.jit
 def store_kvcache_kernel_causal_lm(
@@ -18,15 +24,35 @@ def store_kvcache_kernel_causal_lm(
     k_cache_ptr,
     v_cache_ptr,
     slot_mapping_ptr,
-    D: tl.constexpr
+    k_scale_ptr,
+    v_scale_ptr,
+    HEAD_DIM: tl.constexpr,
+    D: tl.constexpr,
+    KV_CACHE_DTYPE: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr
 ):
     idx = tl.program_id(0)
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
+    offs_d = tl.arange(0, D)
+    key_offsets = idx * key_stride + offs_d
+    value_offsets = idx * value_stride + offs_d
+    key = tl.load(key_ptr + key_offsets).to(tl.float32)
+    value = tl.load(value_ptr + value_offsets).to(tl.float32)
     slot = tl.load(slot_mapping_ptr + idx)
-    cache_offsets = slot * D + tl.arange(0, D)
+    cache_offsets = slot * D + offs_d
+
+    # Triton kernels cannot reference Python globals (e.g., Enum). Use constexpr ints.
+    if KV_CACHE_DTYPE == 3 or KV_CACHE_DTYPE == 4:
+        head_id = offs_d // HEAD_DIM
+        k_scale = tl.load(k_scale_ptr + head_id).to(tl.float32)
+        v_scale = tl.load(v_scale_ptr + head_id).to(tl.float32)
+        k_scale = tl.maximum(k_scale, 1e-8)
+        v_scale = tl.maximum(v_scale, 1e-8)
+        key = key / k_scale
+        value = value / v_scale
+        key = tl.maximum(tl.minimum(key, FP8_MAX), FP8_MIN)
+        value = tl.maximum(tl.minimum(value, FP8_MAX), FP8_MIN)
+
     tl.store(k_cache_ptr + cache_offsets, key)
     tl.store(v_cache_ptr + cache_offsets, value)
     
@@ -40,17 +66,36 @@ def store_kvcache_kernel_diffusion_lm(
     k_cache_ptr,
     v_cache_ptr,
     slot_mapping_ptr,
-    D: tl.constexpr
+    k_scale_ptr,
+    v_scale_ptr,
+    HEAD_DIM: tl.constexpr,
+    D: tl.constexpr,
+    KV_CACHE_DTYPE: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr
 ):
     token_idx = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + token_idx)
     if slot < 0:
         return
-    key_offsets = token_idx * key_stride + tl.arange(0, D)
-    value_offsets = token_idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
+    offs_d = tl.arange(0, D)
+    key_offsets = token_idx * key_stride + offs_d
+    value_offsets = token_idx * value_stride + offs_d
+    key = tl.load(key_ptr + key_offsets).to(tl.float32)
+    value = tl.load(value_ptr + value_offsets).to(tl.float32)
+    cache_offsets = slot * D + offs_d
+
+    if KV_CACHE_DTYPE == 3 or KV_CACHE_DTYPE == 4:
+        head_id = offs_d // HEAD_DIM
+        k_scale = tl.load(k_scale_ptr + head_id).to(tl.float32)
+        v_scale = tl.load(v_scale_ptr + head_id).to(tl.float32)
+        k_scale = tl.maximum(k_scale, 1e-8)
+        v_scale = tl.maximum(v_scale, 1e-8)
+        key = key / k_scale
+        value = value / v_scale
+        key = tl.maximum(tl.minimum(key, FP8_MAX), FP8_MIN)
+        value = tl.maximum(tl.minimum(value, FP8_MAX), FP8_MIN)
+
     tl.store(k_cache_ptr + cache_offsets, key)
     tl.store(v_cache_ptr + cache_offsets, value)
 
@@ -61,8 +106,13 @@ def store_kvcache_kernel_diffusion_lm_distinct(
     k_stride, v_stride,  
     k_cache_stride_nblks, k_cache_stride_h, k_cache_stride_dx, k_cache_stride_blk_sz, k_cache_stride_x,
     v_cache_stride_nblks, v_cache_stride_h, v_cache_stride_d, v_cache_stride_blk_sz,
+    k_scale_ptr, v_scale_ptr,
     nheads, hdim, blk_sz,
-    x: tl.constexpr, D: tl.constexpr
+    x: tl.constexpr,
+    D: tl.constexpr,
+    KV_CACHE_DTYPE: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr
 ):  
     # SPDX-License-Identifier: Apache-2.0
     # SPDX-FileCopyrightText: D2F
@@ -88,8 +138,8 @@ def store_kvcache_kernel_diffusion_lm_distinct(
     offs_d = tl.arange(0, D)
     offs_k = token_idx * k_stride + offs_d
     offs_v = token_idx * v_stride + offs_d
-    k = tl.load(k_ptr + offs_k)
-    v = tl.load(v_ptr + offs_v)
+    k = tl.load(k_ptr + offs_k).to(tl.float32)
+    v = tl.load(v_ptr + offs_v).to(tl.float32)
 
     h_ids = offs_d // hdim
     h_offs = offs_d % hdim
@@ -102,6 +152,16 @@ def store_kvcache_kernel_diffusion_lm_distinct(
     v_cache_offs = (blk_idx * v_cache_stride_nblks + h_ids * v_cache_stride_h +
                     h_offs * v_cache_stride_d + off_blk * v_cache_stride_blk_sz)
     
+    if KV_CACHE_DTYPE == 3 or KV_CACHE_DTYPE == 4:
+        k_scale = tl.load(k_scale_ptr + h_ids).to(tl.float32)
+        v_scale = tl.load(v_scale_ptr + h_ids).to(tl.float32)
+        k_scale = tl.maximum(k_scale, 1e-8)
+        v_scale = tl.maximum(v_scale, 1e-8)
+        k = k / k_scale
+        v = v / v_scale
+        k = tl.maximum(tl.minimum(k, FP8_MAX), FP8_MIN)
+        v = tl.maximum(tl.minimum(v, FP8_MAX), FP8_MIN)
+
     tl.store(k_cache_ptr + k_cache_offs, k)
     tl.store(v_cache_ptr + v_cache_offs, v)
     
@@ -109,7 +169,11 @@ def store_kvcache_kernel_diffusion_lm_distinct(
 def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor, 
                                   k_cache: torch.Tensor, v_cache: torch.Tensor, 
                                   slot_mapping: torch.Tensor, model_type: str = 'causal_lm',
+                                  kv_cache_dtype: str = "bf16",
+                                  k_scale=None,
+                                  v_scale=None,
                                   context: ContextForDiffusionLM = None) -> None:
+    spec = parse_kv_cache_dtype(kv_cache_dtype)
     
     if model_type == 'causal_lm':
         # k_cache: [num_blks, blk_sz, h, hdim]
@@ -120,10 +184,20 @@ def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor,
         assert key.stride(1) == head_dim and value.stride(1) == head_dim
         assert k_cache.stride(1) == D and v_cache.stride(1) == D
         assert N == slot_mapping.numel()
+        k_cache_view = view_fp8_cache(k_cache, kv_cache_dtype)
+        v_cache_view = view_fp8_cache(v_cache, kv_cache_dtype)
+        k_scale_ts = ensure_scale_tensor(k_scale, num_kv_heads=num_heads, device=key.device)
+        v_scale_ts = ensure_scale_tensor(v_scale, num_kv_heads=num_heads, device=key.device)
         store_kvcache_kernel_causal_lm[(N,)](
             key, key.stride(0),
             value, value.stride(0),
-            k_cache, v_cache, slot_mapping, D
+            k_cache_view, v_cache_view, slot_mapping,
+            k_scale_ts, v_scale_ts,
+            head_dim,
+            D,
+            int(spec.enum),
+            float(spec.fp8_min or 0.0),
+            float(spec.fp8_max or 0.0),
         )
     else:
         # TODO: implement diffusion lm kv cache store
@@ -134,41 +208,70 @@ def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor,
         N = key.shape[0]
         assert HDim == key.shape[-1] and NHeads == key.shape[1]
         assert N == slot_mapping.numel()
+        k_cache_view = view_fp8_cache(k_cache, kv_cache_dtype)
+        v_cache_view = view_fp8_cache(v_cache, kv_cache_dtype)
+        k_scale_ts = ensure_scale_tensor(k_scale, num_kv_heads=NHeads, device=key.device)
+        v_scale_ts = ensure_scale_tensor(v_scale, num_kv_heads=NHeads, device=key.device)
         
         GRID = (N, )
         store_kvcache_kernel_diffusion_lm_distinct[GRID](
             key, value,
-            k_cache, v_cache,
+            k_cache_view, v_cache_view,
             slot_mapping,
             key.stride(0), value.stride(0), 
             *k_cache.stride(), *v_cache.stride(),
+            k_scale_ts, v_scale_ts,
             NHeads, HDim, Blk_sz,
-            x, HDim * NHeads
+            x,
+            HDim * NHeads,
+            int(spec.enum),
+            float(spec.fp8_min or 0.0),
+            float(spec.fp8_max or 0.0),
         )
 
 
 def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor, 
                                  k_cache: torch.Tensor, v_cache: torch.Tensor, 
                                  slot_mapping: torch.Tensor, model_type: str = 'causal_lm', 
+                                 kv_cache_dtype: str = "bf16",
+                                 k_scale=None,
+                                 v_scale=None,
                                  context: ContextForDiffusionLM = None) -> None:
+    spec = parse_kv_cache_dtype(kv_cache_dtype)
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert N == slot_mapping.numel(), f"`N`: {N}, `slot_mapping.numel()`: {slot_mapping.numel()}"
+    k_cache_view = view_fp8_cache(k_cache, kv_cache_dtype)
+    v_cache_view = view_fp8_cache(v_cache, kv_cache_dtype)
+    k_scale_ts = ensure_scale_tensor(k_scale, num_kv_heads=num_heads, device=key.device)
+    v_scale_ts = ensure_scale_tensor(v_scale, num_kv_heads=num_heads, device=key.device)
 
     if model_type == 'causal_lm':
         store_kvcache_kernel_causal_lm[(N,)](
             key, key.stride(0),
             value, value.stride(0),
-            k_cache, v_cache, slot_mapping, D
+            k_cache_view, v_cache_view, slot_mapping,
+            k_scale_ts, v_scale_ts,
+            head_dim,
+            D,
+            int(spec.enum),
+            float(spec.fp8_min or 0.0),
+            float(spec.fp8_max or 0.0),
         )
     elif model_type == 'diffusion_lm':
         store_kvcache_kernel_diffusion_lm[(N,)](
             key, key.stride(0),
             value, value.stride(0),
-            k_cache, v_cache, slot_mapping, D
+            k_cache_view, v_cache_view, slot_mapping,
+            k_scale_ts, v_scale_ts,
+            head_dim,
+            D,
+            int(spec.enum),
+            float(spec.fp8_min or 0.0),
+            float(spec.fp8_max or 0.0),
         )
         
 
@@ -179,6 +282,7 @@ def load_kvcache_kernel_kv(k_cache_ptr, v_cache_ptr,
                            k_out_ptr, v_out_ptr, 
                            seqlens_ptr, ctxlens_ptr,
                            cu_seqlens_q_ptr, cu_seqlens_k_ptr,
+                           k_scale_ptr, v_scale_ptr,
                            kv_cache_stride_nblks, kv_cache_stride_blk, kv_cache_stride_h, kv_cache_stride_d,
                            kv_new_stride_s, kv_new_stride_h, kv_new_stride_d,
                            block_table_stride_nseqs, block_table_stride_maxblks,
@@ -189,7 +293,8 @@ def load_kvcache_kernel_kv(k_cache_ptr, v_cache_ptr,
                            HEAD_DIM: tl.constexpr,
                            PAGE_SIZE: tl.constexpr,
                            DIFFUSION_BLOCK_SIZE: tl.constexpr,
-                           KV_LOAD_UNROLL_FACTOR: tl.constexpr):
+                           KV_LOAD_UNROLL_FACTOR: tl.constexpr,
+                           KV_CACHE_DTYPE: tl.constexpr):
     # BUG FIX
     # SPDX-License-Identifier: Apache-2.0
     # SPDX-FileCopyrightText: D2F
@@ -224,8 +329,13 @@ def load_kvcache_kernel_kv(k_cache_ptr, v_cache_ptr,
                 offs_kv_cache_hdim[:, None] * kv_cache_stride_d # Hdim: HeadDim Elems
             )
             kv_cache_mask = offs_kv_cache_seq[None, :] < local_ctxlen
-            k_cache = tl.load(k_cache_ptr + offs_kv_cache, mask=kv_cache_mask, other=0.0)
-            v_cache = tl.load(v_cache_ptr + offs_kv_cache, mask=kv_cache_mask, other=0.0)
+            k_cache = tl.load(k_cache_ptr + offs_kv_cache, mask=kv_cache_mask, other=0.0).to(tl.float32)
+            v_cache = tl.load(v_cache_ptr + offs_kv_cache, mask=kv_cache_mask, other=0.0).to(tl.float32)
+            if KV_CACHE_DTYPE == 3 or KV_CACHE_DTYPE == 4:
+                k_scale = tl.load(k_scale_ptr + kv_head_idx).to(tl.float32)
+                v_scale = tl.load(v_scale_ptr + kv_head_idx).to(tl.float32)
+                k_cache = k_cache * k_scale
+                v_cache = v_cache * v_scale
             
             # Store KV cache into output KV tensors
             off_cu_seqlens_k = seq_idx * cu_seqlens_k_stride
@@ -277,10 +387,17 @@ def load_kvcache_kernel_kv(k_cache_ptr, v_cache_ptr,
 
 def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
                  context: ContextForDiffusionLM,
-                 k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                 k_new: torch.Tensor, v_new: torch.Tensor,
+                 kv_cache_dtype: str = "bf16",
+                 k_scale=None,
+                 v_scale=None,
+                 out_dtype: torch.dtype | None = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    spec = parse_kv_cache_dtype(kv_cache_dtype)
     assert k_cache.shape == v_cache.shape
     assert k_new.shape == v_new.shape
-    N_BLOCKS, PAGE_SIZE, H_KV, HEAD_DIM = k_cache.shape
+    k_cache_view = view_fp8_cache(k_cache, kv_cache_dtype)
+    v_cache_view = view_fp8_cache(v_cache, kv_cache_dtype)
+    N_BLOCKS, PAGE_SIZE, H_KV, HEAD_DIM = k_cache_view.shape
     NUM_SEQS, MAX_SEQ_BLOCKS = context.block_tables.shape
     
     ctxlens = context.context_lens
@@ -298,17 +415,21 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
     assert cu_seqlens_q.shape[0] == NUM_SEQS + 1
     
     kv_output_shape = (sum(total_lens).item(), H_KV, HEAD_DIM)
-    k_output = torch.empty(kv_output_shape, device=k_cache.device, dtype=k_cache.dtype)
+    out_dtype = k_new.dtype if out_dtype is None else out_dtype
+    k_output = torch.empty(kv_output_shape, device=k_cache.device, dtype=out_dtype)
     v_output = torch.empty_like(k_output)
+    k_scale_ts = ensure_scale_tensor(k_scale, num_kv_heads=H_KV, device=k_cache.device)
+    v_scale_ts = ensure_scale_tensor(v_scale, num_kv_heads=H_KV, device=k_cache.device)
     
     GRID = (NUM_SEQS, MAX_SEQ_BLOCKS, H_KV)
     load_kvcache_kernel_kv[GRID](
-        k_cache, v_cache,
+        k_cache_view, v_cache_view,
         k_new, v_new,
         context.block_tables,
         k_output, v_output,
         seqlens, ctxlens,
         cu_seqlens_q, cu_seqlens_k,
+        k_scale_ts, v_scale_ts,
         *k_cache.stride(),
         *k_new.stride(),
         *context.block_tables.stride(),
@@ -321,7 +442,8 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
         HEAD_DIM=HEAD_DIM,
         PAGE_SIZE=PAGE_SIZE,
         DIFFUSION_BLOCK_SIZE=DIFFUSION_BLOCK_SIZE,
-        KV_LOAD_UNROLL_FACTOR=2
+        KV_LOAD_UNROLL_FACTOR=2,
+        KV_CACHE_DTYPE=int(spec.enum),
     )
     
     return k_output, v_output
@@ -330,6 +452,9 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
 def CHECK_STORING(k_cache: torch.Tensor, v_cache: torch.Tensor,
                   k: torch.Tensor, v: torch.Tensor,
                   context: ContextForDiffusionLM) -> None:
+    # FP8 cache uses uint8 storage; exact bitwise match is not expected here.
+    if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
+        return
     k_list, v_list = [torch.split(tensor, context.seq_lens, dim=0) for tensor in (k, v)]
     for seq_idx, seq in enumerate(context.seqs):
         cached_num_tokens = seq.cached_num_tokens
@@ -366,6 +491,8 @@ def CHECK_LOADING(k_comb: torch.Tensor, v_comb: torch.Tensor,
                   k_new: torch.Tensor, v_new: torch.Tensor,
                   k_cache: torch.Tensor, v_cache: torch.Tensor,
                   context: ContextForDiffusionLM) -> Tuple[torch.Tensor, torch.Tensor]:
+    if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
+        return k_comb, v_comb
     try:
         k_list, v_list = [torch.split(tensor, context.seq_lens, dim=0) for tensor in (k_new, v_new)]
         cat_k_list = []
