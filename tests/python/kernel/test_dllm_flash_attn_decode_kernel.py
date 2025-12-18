@@ -1,11 +1,15 @@
+import os
+from pathlib import Path
+
 import torch
 import tilelang
 import tilelang.testing
+import torch.nn.functional as F
 
-from diffulex_kernel.python.dllm_flash_attn import dllm_flash_attn_decode_kernel, dllm_flash_attn_decode
+from diffulex_kernel.python.dllm_flash_attn import dllm_flash_attn_decode_kernel
 
 
-def naive_attention_with_kvcache(
+def naive_sdpa_with_kvcache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -46,6 +50,8 @@ def naive_attention_with_kvcache(
     
     output = torch.zeros_like(q)
     
+    kv_indices = torch.arange(num_heads, device=q.device) // num_groups
+
     for seq_idx in range(num_seqs):
         q_start = cu_seqlens_q[seq_idx].item()
         q_end = cu_seqlens_q[seq_idx + 1].item()
@@ -84,23 +90,24 @@ def naive_attention_with_kvcache(
             k_combined = k_seq
             v_combined = v_seq
         
-        # Compute attention for each head
-        for head_idx in range(num_heads):
-            kv_head_idx = head_idx // num_groups
-            
-            q_head = q_seq[:, head_idx, :]  # [seq_q_len, head_dim]
-            k_head = k_combined[:, kv_head_idx, :]  # [total_kv_len, head_dim]
-            v_head = v_combined[:, kv_head_idx, :]  # [total_kv_len, head_dim]
-            
-            # Compute attention scores
-            attn_scores = torch.matmul(q_head.float(), k_head.float().T) * scale  # [seq_q_len, total_kv_len]
-            
-            # Apply softmax
-            attn_probs = torch.softmax(attn_scores, dim=-1)
-            
-            # Compute output
-            output_head = torch.matmul(attn_probs, v_head.float())  # [seq_q_len, head_dim]
-            output[q_start:q_end, head_idx, :] = output_head.to(output.dtype)
+        # Expand KV per head according to GQA groups and run SDPA once
+        k_per_head = k_combined[:, kv_indices, :]  # [total_kv_len, num_heads, head_dim]
+        v_per_head = v_combined[:, kv_indices, :]
+
+        q_sdpa = q_seq.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seq_q_len, head_dim]
+        k_sdpa = k_per_head.transpose(0, 1).unsqueeze(0)  # [1, num_heads, total_kv_len, head_dim]
+        v_sdpa = v_per_head.transpose(0, 1).unsqueeze(0)
+
+        attn_out = F.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+        )  # [1, num_heads, seq_q_len, head_dim]
+
+        output[q_start:q_end] = attn_out.squeeze(0).transpose(0, 1).to(output.dtype)
     
     return output
 
@@ -182,7 +189,20 @@ def run_dllm_flash_attn_decode(
         num_threads,
     )
     
-    print(decode_kernel.get_kernel_source())
+    kernel_source = decode_kernel.get_kernel_source()
+
+    cuda_cache_dir = os.getenv("CUDA_CACHE_DIR", "/data1/jyj/Diffulex/cuda_cache")
+    cache_root = Path(cuda_cache_dir) / "test_dllm_flash_attn_decode_kernel"
+    case_dir = cache_root / (
+        f"seq{num_seqs}_heads{num_heads}_kv{num_kv_heads}_hd{head_dim}_"
+        f"ctx{context_len}_pbs{page_block_size}_dbs{diffusion_block_size}_"
+        f"block{int(is_block_attn)}_dtype{dtype}_bm{block_m}_bn{block_n}_"
+        f"stg{num_stages}_thr{num_threads}_mq{max_q_len}_mk{max_kv_len}"
+    )
+    case_dir.mkdir(parents=True, exist_ok=True)
+    kernel_path = case_dir / "kernel.cu"
+    kernel_path.write_text(kernel_source)
+    print(f"Kernel source saved to {kernel_path}")
     
     output = decode_kernel(
         q, k, v, k_cache, v_cache,
@@ -194,7 +214,7 @@ def run_dllm_flash_attn_decode(
     )
     
     # Compute reference output
-    ref_output = naive_attention_with_kvcache(
+    ref_output = naive_sdpa_with_kvcache(
         q, k, v, k_cache, v_cache,
         block_tables, context_lens,
         cu_seqlens_q, cu_seqlens_k,
@@ -360,21 +380,21 @@ def test_decode_bf16_diffusion_block_64():
     )
 
 
-def test_decode_f16_single_seq():
-    """Test with single sequence, float16."""
-    run_dllm_flash_attn_decode(
-        num_seqs=1,
-        num_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-        max_q_len=64,
-        max_kv_len=64,
-        context_len=128,
-        page_block_size=32,
-        diffusion_block_size=32,
-        is_block_attn=False,
-        dtype="float16",
-    )
+# def test_decode_f16_single_seq():
+#     """Test with single sequence, float16."""
+#     run_dllm_flash_attn_decode(
+#         num_seqs=1,
+#         num_heads=32,
+#         num_kv_heads=8,
+#         head_dim=128,
+#         max_q_len=64,
+#         max_kv_len=64,
+#         context_len=128,
+#         page_block_size=32,
+#         diffusion_block_size=32,
+#         is_block_attn=False,
+#         dtype="float16",
+#     )
 
 
 def test_decode_bf16_varied_stages():

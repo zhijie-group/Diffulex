@@ -11,11 +11,11 @@ from diffulex_kernel.python.auto_tuner import build_configs
 from diffulex_kernel.python.kv_cache_kernels import load_kvcache
 from diffulex.attention.metadata import AttnMetaDataBase, is_warming_up
 
-@register_cuda_postproc_callback
-def tilelang_callback_cuda_postproc(code, _):
-    code = "// tilelang_callback_cuda_postproc: generated CUDA code by TileLang\n" + code
-    print(code)
-    return code
+# @register_cuda_postproc_callback
+# def tilelang_callback_cuda_postproc(code, _):
+#     code = "// tilelang_callback_cuda_postproc: generated CUDA code by TileLang\n" + code
+#     print(code)
+#     return code
 
 kernel_config = None
 
@@ -57,8 +57,7 @@ def dllm_flash_attn_prefill_kernel(
         max_seqlen_q: T.int32,
         O: T.Tensor(O_SHAPE, DTYPE),
     ):
-        with T.Kernel(T.ceildiv(max_seqlen_q, BLOCK_M), NUM_HEADS, NUM_SEQS, 
-                      threads=NUM_THREADS) as (bx, by, bz):
+        with T.Kernel(T.ceildiv(max_seqlen_q, BLOCK_M), NUM_HEADS, NUM_SEQS, threads=NUM_THREADS) as (bx, by, bz):
             Q_shared = T.alloc_shared([BLOCK_M, HEAD_DIM], DTYPE)
             K_shared = T.alloc_shared([BLOCK_N, HEAD_DIM], DTYPE)
             V_shared = T.alloc_shared([BLOCK_N, HEAD_DIM], DTYPE)
@@ -156,7 +155,7 @@ def dllm_flash_attn_prefill_kernel(
             T.copy(acc_output, O_shared)
             for i, d_idx in T.Parallel(BLOCK_M, HEAD_DIM):
                 if i + q_block_idx * BLOCK_M < cur_q_seqlen:
-                    O[i + q_block_idx * BLOCK_M, head_idx, d_idx] = O_shared[i, d_idx]
+                    O[i + q_start_idx + q_block_idx * BLOCK_M, head_idx, d_idx] = O_shared[i, d_idx]
             
     return kernel
 
@@ -244,6 +243,8 @@ def dllm_flash_attn_decode_kernel(
             
             cur_q_seqlen = q_end_idx - q_start_idx
             cur_kv_seqlen = kv_end_idx - kv_start_idx
+            T.device_assert(cur_q_seqlen == DIFFUSION_BLOCK_SIZE, "cur_q_seqlen must be equal to DIFFUSION_BLOCK_SIZE")
+            T.device_assert(cur_kv_seqlen == DIFFUSION_BLOCK_SIZE, "cur_kv_seqlen must be equal to DIFFUSION_BLOCK_SIZE")
             
             cur_context_len = context_lens[seq_idx]
             

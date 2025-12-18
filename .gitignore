@@ -24,6 +24,7 @@ TestResults.xml
 *.pyc
 *.egg-info
 lora_weight*
+*.log
 log/
 dist/
 build/
