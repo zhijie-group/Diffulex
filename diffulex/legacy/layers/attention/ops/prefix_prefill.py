@@ -1054,6 +1054,8 @@ def context_attention_fwd(q,
             **extra_kargs)
     else:
         # FIXME: computation not correct
+        # Note: BLOCK_M = BLOCK_N = diffusion_blk_sz * 2 is required for correctness
+        # Reducing it changes the loop bounds and breaks the computation
         BLOCK_M = BLOCK_N = diffusion_blk_sz * 2
         GRID = (batch, head, triton.cdiv(max_input_len, BLOCK_M))
         _fwd_kernel_d2f[GRID](
@@ -1082,9 +1084,9 @@ def context_attention_fwd(q,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
             DIFFUSION_BLK_SZ=diffusion_blk_sz,
-            num_unroll_cache=4,
+            num_unroll_cache=2,  # Reduced from 4 to 2 to reduce shared memory usage
             num_unroll_request=1,
-            num_warps=4,
+            num_warps=1,  # Reduced from 4 to 1 to reduce shared memory usage  
             num_stages=1,
             **extra_kargs)
     return

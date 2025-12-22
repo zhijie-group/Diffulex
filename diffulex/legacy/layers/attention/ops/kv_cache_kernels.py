@@ -161,7 +161,7 @@ def store_kvcache_kernel_diffusion_lm_distinct(
         v = v / v_scale
         k = tl.maximum(tl.minimum(k, FP8_MAX), FP8_MIN)
         v = tl.maximum(tl.minimum(v, FP8_MAX), FP8_MIN)
-
+    
     tl.store(k_cache_ptr + k_cache_offs, k)
     tl.store(v_cache_ptr + v_cache_offs, v)
     
