@@ -5,7 +5,7 @@ from typing import List
 
 from vllm.platforms import current_platform
 
-from diffulex.legacy.layers.attention.ops import store_kvcache_unified_layout, load_kvcache
+from diffulex_legacy.layers.attention.ops import store_kvcache_unified_layout, load_kvcache
 
 
 @dataclass

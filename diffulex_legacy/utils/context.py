@@ -21,6 +21,7 @@ class ContextBase:
 class ContextForCausalLM(ContextBase):
     kv_cache_layout: str = "unified"  # Only "unified" is supported for Causal LM currently
     need_kv_cache_store: bool = True
+    kv_cache_dtype: str = "bf16"  # "bf16", "fp16", "fp32", "fp8", "fp8_e4m3", "fp8_e5m2"
 
 _CONTEXT_FOR_CAUSAL_LM = ContextForCausalLM()
 
@@ -31,14 +32,16 @@ def set_context_causal_lm(
     is_prefill,
     cu_seqlens_q=None, cu_seqlens_k=None,
     max_seqlen_q=0, max_seqlen_k=0,
-    slot_mapping=None, context_lens=None, block_tables=None
+    slot_mapping=None, context_lens=None, block_tables=None,
+    kv_cache_dtype: str = "bf16"
 ) -> None:
     global _CONTEXT_FOR_CAUSAL_LM
     _CONTEXT_FOR_CAUSAL_LM = ContextForCausalLM(
         is_prefill, 
         cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q, max_seqlen_k, 
-        slot_mapping, context_lens, block_tables
+        slot_mapping, context_lens, block_tables,
+        kv_cache_dtype=kv_cache_dtype
     )
 
 def reset_context_causal_lm() -> None:
