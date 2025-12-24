@@ -164,10 +164,11 @@ class Attention(nn.Module):
                 k_scale, v_scale = self._update_and_compute_fp8_scales(k, v, kv_cache_dtype, k.device)
                 store_kvcache = store_kvcache_unified_layout if is_unified_layout else store_kvcache_distinct_layout
                 store_kvcache(
-                    k, v, k_cache, v_cache, context.slot_mapping, self.model_type, context,
+                    k, v, k_cache, v_cache, context.slot_mapping, self.model_type,
                     kv_cache_dtype=kv_cache_dtype,
                     k_scale=k_scale,
-                    v_scale=v_scale
+                    v_scale=v_scale,
+                    context=context
                 )
                 # CHECK_STORING(k_cache, v_cache, k, v, context)
 
