@@ -45,3 +45,7 @@ cuda_cache/
 *.swp
 *.swo
 *~
+kernel_diff_analysis_zh.md
+kernel_diff_analysis.md
+tilelang_optimization_analysis.md
+boundary_check_comparison.md
