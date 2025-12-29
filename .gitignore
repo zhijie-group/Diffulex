@@ -37,6 +37,7 @@ autotuner.log
 Fast-dLLM
 Discrete-Diffusion-Forcing
 position_explanation.md
+temp/
 
 # IDE
 .vscode/

@@ -114,7 +114,30 @@ class Attention(nn.Module):
                 
                 o = dllm_flash_attn_decode(q, k, v, k_cache, v_cache, self.scale, attn_metadata)
             else:
-                raise NotImplementedError("Distinct layout is not supported yet...")
+                # Distinct layout: use varlen mode with load_kvcache
+                from diffulex_kernel import load_kvcache
+                from diffulex.utils.quantization.context import get_kv_cache_strategy
+                from diffulex.utils.quantization.strategies import KVCacheFP8RunningMaxStrategy
+                
+                strategy = get_kv_cache_strategy()
+                if strategy is not None and isinstance(strategy, KVCacheFP8RunningMaxStrategy):
+                    # FP8 quantization: pass scales to metadata for load_kvcache to handle
+                    if self.k_scale is None or self.v_scale is None:
+                        raise ValueError("FP8 quantization requires k_scale and v_scale")
+                    
+                    # Pass scale to metadata (load_kvcache will handle dequantization)
+                    attn_metadata.k_scale = self.k_scale
+                    attn_metadata.v_scale = self.v_scale
+                
+                # Distinct layout uses varlen mode
+                k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)
+                from flash_attn import flash_attn_varlen_func
+                o = flash_attn_varlen_func(
+                    q, k_comb, v_comb,
+                    attn_metadata.cu_seqlens_q, attn_metadata.cu_seqlens_k,
+                    attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k,
+                    softmax_scale=self.scale, block_table=None
+                )
             
         # Final reshape
         return rearrange(o, 's nh hd -> s (nh hd)').contiguous()
