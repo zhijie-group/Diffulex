@@ -13,6 +13,9 @@ from diffulex.sampler import AutoSampler
 from diffulex.engine.sequence import SequenceBase
 from diffulex.model import AutoModelForDiffusionLM
 from diffulex.engine.strategy_registry import DiffulexStrategyRegistry
+from diffulex.utils.quantization.factory import QuantizationStrategyFactory
+from diffulex.utils.quantization.context import get_kv_cache_strategy
+from diffulex.utils.quantization.strategies import NoQuantizationStrategy
 
 
 class ModelRunnerBase(ABC):
@@ -39,8 +42,10 @@ class ModelRunnerBase(ABC):
         torch.set_default_device(f"cuda:{device_id}")
         self.model = self.load_model(config)
         self.sampler = self.load_sampler(config)
+        # Initialize quantization context
+        QuantizationStrategyFactory.create_from_config(config)
         self.warmup_model()
-        self.allocate_kv_cache()  # NOCHANGE
+        self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
 
@@ -143,18 +148,19 @@ class ModelRunnerBase(ABC):
         else:
             raise AttributeError(f"Cannot determine head_dim from config: {type(hf_config)}")
 
-        dtype = (
-            hf_config.torch_dtype
-            if hasattr(hf_config, "torch_dtype") and hf_config.torch_dtype
-            else torch.bfloat16
-        )
+        # Get storage dtype and itemsize from quantization strategy
+        strategy = get_kv_cache_strategy()
+        if strategy is None:
+            strategy = NoQuantizationStrategy()
+        storage_dtype, itemsize = strategy.get_storage_dtype()
+        
         block_bytes = (
             2
             * hf_config.num_hidden_layers
             * self.block_size
             * num_kv_heads
             * head_dim
-            * dtype.itemsize
+            * itemsize
         )
         get_num_kvcache_blocks = (
             lambda gpu_memory_utilization: int(total * gpu_memory_utilization - used - peak + current)
@@ -197,6 +203,7 @@ class ModelRunnerBase(ABC):
                 head_dim // x,
                 self.block_size,
                 x,
+                dtype=storage_dtype,
             )
             self.v_cache = torch.zeros(
                 hf_config.num_hidden_layers,
@@ -204,6 +211,7 @@ class ModelRunnerBase(ABC):
                 num_kv_heads,
                 head_dim,
                 self.block_size,
+                dtype=storage_dtype,
             )
             layer_id = 0
             for module in self.model.modules():
@@ -219,6 +227,7 @@ class ModelRunnerBase(ABC):
                 self.block_size,
                 num_kv_heads,
                 head_dim,
+                dtype=storage_dtype,
             )
             layer_id = 0
             for module in self.model.modules():
@@ -232,6 +241,35 @@ class ModelRunnerBase(ABC):
                     layout=config.kv_cache_layout
                 )
             )
+        
+        # Allocate scale tensors if quantization strategy requires them
+        # Get device from cache (already allocated above)
+        if config.kv_cache_layout == "distinct":
+            device = self.k_cache.device
+        else:  # unified
+            device = self.kv_cache.device
+        k_scale_init, v_scale_init = strategy.init_scales(num_kv_heads, device)
+        if k_scale_init is not None and v_scale_init is not None:
+            # Allocate scale tensors: [num_layers, num_kv_heads]
+            self.k_scale = torch.zeros(
+                hf_config.num_hidden_layers, num_kv_heads,
+                dtype=torch.float32, device=device
+            )
+            self.v_scale = torch.zeros(
+                hf_config.num_hidden_layers, num_kv_heads,
+                dtype=torch.float32, device=device
+            )
+            # Initialize with strategy's initial scale values
+            self.k_scale[:] = k_scale_init[None, :]
+            self.v_scale[:] = v_scale_init[None, :]
+            
+            # Bind scales to Attention modules
+            layer_id = 0
+            for module in self.model.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    module.k_scale = self.k_scale[layer_id]
+                    module.v_scale = self.v_scale[layer_id]
+                    layer_id += 1
 
     def prepare_block_tables(self, seqs: list[SequenceBase]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -290,6 +328,16 @@ class AutoModelRunner(DiffulexStrategyRegistry):
 
     @classmethod
     def from_config(cls, config: Config, rank: int, event: Event | list[Event]):
+        # Ensure project root is in sys.path for spawn mode subprocesses
+        import sys
+        import os
+        if not any('diffulex_kernel' in p for p in sys.path):
+            # Try to find project root by locating diffulex package
+            diffulex_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if os.path.basename(diffulex_path) == 'diffulex':
+                project_root = os.path.dirname(diffulex_path)
+                if project_root not in sys.path:
+                    sys.path.insert(0, project_root)
         cls._MODULE_MAPPING: dict[str, RunnerFactory]
         candidates: list[str] = []
         for attr in ("decoding_strategy",):

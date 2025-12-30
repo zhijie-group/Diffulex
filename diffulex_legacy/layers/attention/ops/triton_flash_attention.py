@@ -229,12 +229,13 @@ def _attn_fwd_inner(
 
 
 def get_cdna_autotune_configs():
+    # For Nvidia GPU (CUDA), waves_per_eu is not supported and should not be included
     return [
         triton.Config(
             {
                 'BLOCK_M': 256,
                 'BLOCK_N': 64,
-                'waves_per_eu': 2,
+                # 'waves_per_eu': 2,
                 'PRE_LOAD_V': False
             },
             num_stages=1,
@@ -243,7 +244,7 @@ def get_cdna_autotune_configs():
             {
                 'BLOCK_M': 128,
                 'BLOCK_N': 128,
-                'waves_per_eu': 2,
+                # 'waves_per_eu': 2,
                 'PRE_LOAD_V': False
             },
             num_stages=1,
@@ -252,7 +253,7 @@ def get_cdna_autotune_configs():
             {
                 'BLOCK_M': 256,
                 'BLOCK_N': 128,
-                'waves_per_eu': 2,
+                # 'waves_per_eu': 2,
                 'PRE_LOAD_V': False
             },
             num_stages=1,
@@ -261,7 +262,7 @@ def get_cdna_autotune_configs():
             {
                 'BLOCK_M': 128,
                 'BLOCK_N': 64,
-                'waves_per_eu': 1,
+                # 'waves_per_eu': 1,
                 'PRE_LOAD_V': False
             },
             num_stages=1,
@@ -270,7 +271,7 @@ def get_cdna_autotune_configs():
             {
                 'BLOCK_M': 128,
                 'BLOCK_N': 64,
-                'waves_per_eu': 3,
+                # 'waves_per_eu': 3,
                 'PRE_LOAD_V': True
             },
             num_stages=1,
@@ -279,7 +280,7 @@ def get_cdna_autotune_configs():
             {
                 'BLOCK_M': 128,
                 'BLOCK_N': 64,
-                'waves_per_eu': 3,
+                # 'waves_per_eu': 3,
                 'PRE_LOAD_V': False
             },
             num_stages=1,
@@ -288,7 +289,7 @@ def get_cdna_autotune_configs():
             {
                 'BLOCK_M': 64,
                 'BLOCK_N': 64,
-                'waves_per_eu': 4,
+                # 'waves_per_eu': 4,
                 'PRE_LOAD_V': False
             },
             num_stages=1,
@@ -297,7 +298,7 @@ def get_cdna_autotune_configs():
             {
                 'BLOCK_M': 32,
                 'BLOCK_N': 32,
-                'waves_per_eu': 4,
+                # 'waves_per_eu': 4,
                 'PRE_LOAD_V': False
             },
             num_stages=1,
@@ -536,6 +537,7 @@ def attn_fwd(
             return
 
     # If MQA / GQA, set the K and V head offsets appropriately.
+    # Compute GROUP_SIZE and off_h_k early so they can be used in both FP8 and non-FP8 paths
     GROUP_SIZE: tl.constexpr = HQ // HK
     off_h_k = off_h_q // GROUP_SIZE if GROUP_SIZE != 1 else off_h_q
 
@@ -620,10 +622,18 @@ def attn_fwd(
     q = load_fn(Q_block_ptr, True, padded_head, "zero")
     if not USE_FP8:
         q = (q * qk_scale).to(Q_block_ptr.type.element_ty)
-        acc_scale = 1.0
+        acc_scale: tl.float32 = 1.0
     else:
-        qk_scale *= q_scale * k_scale
-        acc_scale = p_scale * v_scale
+        # Load per-head scale values from scale tensors
+        # q_scale, k_scale, v_scale are per-head tensors, so we load the value for current head
+        # Note: off_h_k is already computed above (line 542)
+        q_scale_val = tl.load(q_scale + off_h_q)
+        k_scale_val = tl.load(k_scale + off_h_k)
+        v_scale_val = tl.load(v_scale + off_h_k)
+        # p_scale is a scalar tensor (torch.ones(1, ...)), so we load from index 0
+        p_scale_val = tl.load(p_scale)
+        qk_scale *= q_scale_val * k_scale_val
+        acc_scale = p_scale_val * v_scale_val
 
     # Here we compute how many full and masked blocks we have.
     padded_block_k = n_extra_tokens != 0
@@ -855,6 +865,10 @@ class _attention(torch.autograd.Function):
             def check_and_convert(t, scale):
                 if t.dtype != float8:
                     descale = 1.0 / scale
+                    # Reshape scale to broadcast correctly: [num_heads] -> [1, num_heads, 1]
+                    # This allows broadcasting with t of shape [seq_len, num_heads, head_dim]
+                    if descale.dim() == 1 and t.dim() == 3:
+                        descale = descale.view(1, -1, 1)
                     ts = (t * descale).clamp(min=float8_info.min,
                                              max=float8_info.max)
                     return ts.to(float8)
@@ -930,7 +944,17 @@ class _attention(torch.autograd.Function):
         else:
             bias_strides = (0, 0, 0, 0)
 
-        p_descale = 1.0 / p_scale
+        # IMPORTANT: `p_descale` is used as a scalar inside Triton kernel (e.g. `p *= p_descale`).
+        # If we pass a 1-element tensor here (common when fp8_scales provides `p_scale` as Tensor),
+        # Triton will treat it as pointer<fp32> and fail to compile.
+        if isinstance(p_scale, torch.Tensor):
+            if p_scale.numel() != 1:
+                raise ValueError(
+                    f"Expected p_scale to be a scalar tensor (numel==1), got shape={tuple(p_scale.shape)}"
+                )
+            p_descale = float(1.0 / float(p_scale.item()))
+        else:
+            p_descale = float(1.0 / float(p_scale))
         o_descale = 1.0 / fp8_out_scale.item(
         ) if fp8_out_scale is not None else 1.0
 
@@ -1004,7 +1028,8 @@ def triton_flash_attention(
     fp8_out_scale=None,
     block_table=None,
 ):
-    _attention.apply(
+    # _attention.apply returns (o, encoded_softmax). Most callsites expect only `o`.
+    o, _ = _attention.apply(
         q,
         k,
         v,
@@ -1020,3 +1045,4 @@ def triton_flash_attention(
         fp8_out_scale,
         block_table,
     )
+    return o

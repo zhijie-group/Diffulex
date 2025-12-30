@@ -14,7 +14,7 @@ Diffulex is a Paged Attention-based dLLM accelerated decoding inference framewor
 - 12/22/2025 ✨: We are excited to announce that Diffulex, a Paged Attention-based dLLM accelerated decoding inference framework, is now open source and available to the public!
 
 ## Tested Devices
-Although Diffulex aims to be portable across a range of Devices, it has been specifically tested and validated on the following devices: for NVIDIA GPUs, this includes the H200 (with Auto TMA/WGMMA support), A100, RTX 4090, RTX 3090.
+Although Diffulex aims to be portable across a range of Devices, it has been specifically tested and validated on the following devices: for NVIDIA GPUs, this includes the H200, A100, RTX 4090, RTX 3090.
 
 ## Installation
 ### Method 1: Install with Pip

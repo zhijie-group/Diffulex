@@ -18,6 +18,9 @@ class AttnMetaDataBase:
     attn_type: str = "block_attention"
     diffusion_block_size: int = 32
     decode_mode: str = "static"
+    k_scale: torch.Tensor | None = None  # Quantization scale for K cache, shape [num_kv_heads]
+    v_scale: torch.Tensor | None = None  # Quantization scale for V cache, shape [num_kv_heads]
+    q_scale: torch.Tensor | None = None  # Quantization scale for Q, strategy-defined shape (e.g. [num_heads] or [1])
     
     @property
     def num_seqs(self) -> int:

@@ -42,6 +42,10 @@ class Config:
     num_kvcache_blocks: int = -1
     k_cache_hdim_split_factor_x: int = 8
     kv_cache_layout: str = "unified"  # "unified" or "distinct"
+    kv_cache_dtype: str = "bf16"  # "bf16", "fp16", "fp32", "fp8_e4m3", "fp8_e5m2"
+    # Attention-Q dtype (activation quantization). "bf16" default; "fp8" is a placeholder
+    # for future kernels (enabling it will currently raise NotImplementedError at runtime).
+    attn_q_dtype: str = "bf16"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

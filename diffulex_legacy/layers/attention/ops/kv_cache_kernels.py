@@ -294,7 +294,10 @@ def load_kvcache_kernel_kv(k_cache_ptr, v_cache_ptr,
                            PAGE_SIZE: tl.constexpr,
                            DIFFUSION_BLOCK_SIZE: tl.constexpr,
                            KV_LOAD_UNROLL_FACTOR: tl.constexpr,
-                           KV_CACHE_DTYPE: tl.constexpr):
+                           KV_CACHE_DTYPE: tl.constexpr,
+                           OUT_DTYPE: tl.constexpr,
+                           FP8_MIN: tl.constexpr,
+                           FP8_MAX: tl.constexpr):
     # BUG FIX
     # SPDX-License-Identifier: Apache-2.0
     # SPDX-FileCopyrightText: D2F
@@ -329,13 +332,27 @@ def load_kvcache_kernel_kv(k_cache_ptr, v_cache_ptr,
                 offs_kv_cache_hdim[:, None] * kv_cache_stride_d # Hdim: HeadDim Elems
             )
             kv_cache_mask = offs_kv_cache_seq[None, :] < local_ctxlen
-            k_cache = tl.load(k_cache_ptr + offs_kv_cache, mask=kv_cache_mask, other=0.0).to(tl.float32)
-            v_cache = tl.load(v_cache_ptr + offs_kv_cache, mask=kv_cache_mask, other=0.0).to(tl.float32)
-            if KV_CACHE_DTYPE == 3 or KV_CACHE_DTYPE == 4:
-                k_scale = tl.load(k_scale_ptr + kv_head_idx).to(tl.float32)
-                v_scale = tl.load(v_scale_ptr + kv_head_idx).to(tl.float32)
-                k_cache = k_cache * k_scale
-                v_cache = v_cache * v_scale
+            k_cache = tl.load(k_cache_ptr + offs_kv_cache, mask=kv_cache_mask, other=0.0)
+            v_cache = tl.load(v_cache_ptr + offs_kv_cache, mask=kv_cache_mask, other=0.0)
+
+            # If output is FP8, don't dequantize (keep FP8)
+            # If output is not FP8, dequantize to float32 first
+            if OUT_DTYPE == 3 or OUT_DTYPE == 4:
+                # FP8 output: store directly without dequantization
+                k_cache_out = k_cache
+                v_cache_out = v_cache
+            else:
+                # Non-FP8 output: dequantize if needed
+                if KV_CACHE_DTYPE == 3 or KV_CACHE_DTYPE == 4:
+                    k_cache = k_cache.to(tl.float32)
+                    v_cache = v_cache.to(tl.float32)
+                    k_scale = tl.load(k_scale_ptr + kv_head_idx).to(tl.float32)
+                    v_scale = tl.load(v_scale_ptr + kv_head_idx).to(tl.float32)
+                    k_cache_out = k_cache * k_scale
+                    v_cache_out = v_cache * v_scale
+                else:
+                    k_cache_out = k_cache.to(tl.float32)
+                    v_cache_out = v_cache.to(tl.float32)
             
             # Store KV cache into output KV tensors
             off_cu_seqlens_k = seq_idx * cu_seqlens_k_stride
@@ -346,8 +363,8 @@ def load_kvcache_kernel_kv(k_cache_ptr, v_cache_ptr,
                 kv_head_idx * kv_out_stride_h + # Hkv: HeadId
                 offs_kv_cache_hdim[:, None] * kv_out_stride_d # Hdim: HeadDim Elems
             )
-            tl.store(k_out_ptr + offs_kv_cache_to_out, k_cache, mask=kv_cache_mask)
-            tl.store(v_out_ptr + offs_kv_cache_to_out, v_cache, mask=kv_cache_mask)
+            tl.store(k_out_ptr + offs_kv_cache_to_out, k_cache_out, mask=kv_cache_mask)
+            tl.store(v_out_ptr + offs_kv_cache_to_out, v_cache_out, mask=kv_cache_mask)
 
     # Load and store active KV only once when first meet
     if local_blk_idx == LAST_BLK_ID: 
@@ -381,8 +398,32 @@ def load_kvcache_kernel_kv(k_cache_ptr, v_cache_ptr,
                 kv_head_idx * kv_out_stride_h + # Hkv: HeadId
                 offs_kv_new_hdim[:, None] * kv_out_stride_d # Hdim: HeadDim Elems
             )
-            tl.store(k_out_ptr + offs_cur_kv_new_to_out, k_new)
-            tl.store(v_out_ptr + offs_cur_kv_new_to_out, v_new)
+            # IMPORTANT:
+            # - When OUT_DTYPE is FP8, the output K/V are consumed by FP8 attention kernels
+            #   which assume K/V are in the *quantized domain* (value / scale).
+            # - Cached K/V are already stored in quantized FP8 domain.
+            # - But k_new/v_new are BF16/FP16 values. If we store them directly into FP8 output,
+            #   they would be cast without dividing by scale, causing a scale mismatch and large errors.
+            if OUT_DTYPE == 3 or OUT_DTYPE == 4:
+                if KV_CACHE_DTYPE == 3 or KV_CACHE_DTYPE == 4:
+                    k_s = tl.load(k_scale_ptr + kv_head_idx).to(tl.float32)
+                    v_s = tl.load(v_scale_ptr + kv_head_idx).to(tl.float32)
+                    k_s = tl.maximum(k_s, 1e-8)
+                    v_s = tl.maximum(v_s, 1e-8)
+                    k_new_q = (k_new.to(tl.float32) / k_s)
+                    v_new_q = (v_new.to(tl.float32) / v_s)
+                else:
+                    # If cache isn't FP8, treat scale as 1.0 for quantized output.
+                    k_new_q = k_new.to(tl.float32)
+                    v_new_q = v_new.to(tl.float32)
+                # Clamp to FP8 representable range before storing
+                k_new_q = tl.maximum(tl.minimum(k_new_q, FP8_MAX), FP8_MIN)
+                v_new_q = tl.maximum(tl.minimum(v_new_q, FP8_MAX), FP8_MIN)
+                tl.store(k_out_ptr + offs_cur_kv_new_to_out, k_new_q)
+                tl.store(v_out_ptr + offs_cur_kv_new_to_out, v_new_q)
+            else:
+                tl.store(k_out_ptr + offs_cur_kv_new_to_out, k_new)
+                tl.store(v_out_ptr + offs_cur_kv_new_to_out, v_new)
 
 
 def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
@@ -416,6 +457,28 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
     
     kv_output_shape = (sum(total_lens).item(), H_KV, HEAD_DIM)
     out_dtype = k_new.dtype if out_dtype is None else out_dtype
+    
+    # Determine OUT_DTYPE for kernel (constexpr int)
+    from diffulex.utils.kv_cache_dtype import KvCacheDType
+    if out_dtype == torch.bfloat16:
+        out_dtype_enum = int(KvCacheDType.BF16)  # 0
+    elif out_dtype == torch.float16:
+        out_dtype_enum = int(KvCacheDType.FP16)  # 1
+    elif out_dtype == torch.float32:
+        out_dtype_enum = int(KvCacheDType.FP32)  # 2
+    elif spec.is_fp8 and out_dtype == spec.fp8_view_dtype:
+        out_dtype_enum = int(spec.enum)  # 3 or 4
+    else:
+        # Default: use k_new.dtype
+        if k_new.dtype == torch.bfloat16:
+            out_dtype_enum = int(KvCacheDType.BF16)
+        elif k_new.dtype == torch.float16:
+            out_dtype_enum = int(KvCacheDType.FP16)
+        elif k_new.dtype == torch.float32:
+            out_dtype_enum = int(KvCacheDType.FP32)
+        else:
+            raise ValueError(f"Unsupported out_dtype: {out_dtype}")
+    
     k_output = torch.empty(kv_output_shape, device=k_cache.device, dtype=out_dtype)
     v_output = torch.empty_like(k_output)
     k_scale_ts = ensure_scale_tensor(k_scale, num_kv_heads=H_KV, device=k_cache.device)
@@ -444,6 +507,9 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
         DIFFUSION_BLOCK_SIZE=DIFFUSION_BLOCK_SIZE,
         KV_LOAD_UNROLL_FACTOR=2,
         KV_CACHE_DTYPE=int(spec.enum),
+        OUT_DTYPE=out_dtype_enum,
+        FP8_MIN=float(spec.fp8_min) if spec.is_fp8 and spec.fp8_min is not None else 0.0,
+        FP8_MAX=float(spec.fp8_max) if spec.is_fp8 and spec.fp8_max is not None else 0.0,
     )
     
     return k_output, v_output

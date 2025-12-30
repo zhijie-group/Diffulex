@@ -18,7 +18,8 @@ for py_file in _current_dir.glob("*.py"):
         except Exception as e:
             # Skip modules that fail to import
             import warnings
-            warnings.warn(f"Failed to import {module_name}: {e}", ImportWarning)
+            # ImportWarning is ignored by default, which can hide real registration problems.
+            warnings.warn(f"Failed to import {module_name}: {e!r}", RuntimeWarning)
 
 __all__ = _model_modules.copy()
 

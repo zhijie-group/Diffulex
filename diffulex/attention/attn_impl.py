@@ -25,6 +25,9 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        # Quantization scales (will be bound by ModelRunner if strategy requires them)
+        self.k_scale = None
+        self.v_scale = None
         
         self.q_shape = {
             'nh': self.num_heads,
@@ -53,6 +56,21 @@ class Attention(nn.Module):
         # Fast Store KV cache
         if k_cache.numel() and v_cache.numel():
             if attn_metadata.need_kv_cache_store:
+                # Update scales if quantization strategy requires them
+                if self.k_scale is not None and self.v_scale is not None:
+                    from diffulex.utils.quantization.context import get_kv_cache_strategy
+                    strategy = get_kv_cache_strategy()
+                    if strategy is not None:
+                        self.k_scale, self.v_scale = strategy.update_scales(
+                            k, v, self.k_scale, self.v_scale,
+                            self.num_kv_heads, k.device
+                        )
+                    # Pass scale to metadata if required by strategy
+                    if strategy is not None:
+                        strategy.maybe_set_attn_metadata_scales(
+                            attn_metadata, k_scale=self.k_scale, v_scale=self.v_scale
+                        )
+                
                 store_kvcache = store_kvcache_unified_layout if is_unified_layout else store_kvcache_distinct_layout
                 store_kvcache(k, v, k_cache, v_cache, attn_metadata.slot_mapping, attn_metadata)
 
@@ -64,9 +82,35 @@ class Attention(nn.Module):
             o = dllm_flash_attn_prefill(q, k, v, self.scale, attn_metadata)
         else:
             if is_unified_layout:
+                from diffulex.utils.quantization.context import get_kv_cache_strategy
+                strategy = get_kv_cache_strategy()
+                if strategy is not None:
+                    # e.g. FP8: pass scales to metadata for kernel / load_kvcache to handle
+                    strategy.maybe_set_attn_metadata_scales(
+                        attn_metadata, k_scale=self.k_scale, v_scale=self.v_scale
+                    )
+                
                 o = dllm_flash_attn_decode(q, k, v, k_cache, v_cache, self.scale, attn_metadata)
             else:
-                raise NotImplementedError("Distinct layout is not supported yet...")
+                # Distinct layout: use varlen mode with load_kvcache
+                from diffulex_kernel import load_kvcache
+                from diffulex.utils.quantization.context import get_kv_cache_strategy
+                strategy = get_kv_cache_strategy()
+                if strategy is not None:
+                    # e.g. FP8: pass scales to metadata for load_kvcache to handle
+                    strategy.maybe_set_attn_metadata_scales(
+                        attn_metadata, k_scale=self.k_scale, v_scale=self.v_scale
+                    )
+                
+                # Distinct layout uses varlen mode
+                k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)
+                from flash_attn import flash_attn_varlen_func
+                o = flash_attn_varlen_func(
+                    q, k_comb, v_comb,
+                    attn_metadata.cu_seqlens_q, attn_metadata.cu_seqlens_k,
+                    attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k,
+                    softmax_scale=self.scale, block_table=None
+                )
             
         # Final reshape
         return rearrange(o, 's nh hd -> s (nh hd)').contiguous()
