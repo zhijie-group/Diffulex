@@ -65,9 +65,11 @@ class Attention(nn.Module):
                             k, v, self.k_scale, self.v_scale,
                             self.num_kv_heads, k.device
                         )
-                    # Pass scale to metadata for store kernel
-                    attn_metadata.k_scale = self.k_scale
-                    attn_metadata.v_scale = self.v_scale
+                    # Pass scale to metadata if required by strategy
+                    if strategy is not None:
+                        strategy.maybe_set_attn_metadata_scales(
+                            attn_metadata, k_scale=self.k_scale, v_scale=self.v_scale
+                        )
                 
                 store_kvcache = store_kvcache_unified_layout if is_unified_layout else store_kvcache_distinct_layout
                 store_kvcache(k, v, k_cache, v_cache, attn_metadata.slot_mapping, attn_metadata)
@@ -80,38 +82,25 @@ class Attention(nn.Module):
             o = dllm_flash_attn_prefill(q, k, v, self.scale, attn_metadata)
         else:
             if is_unified_layout:
-                # For FP8: pass scales to metadata for kernel to handle dequantization
                 from diffulex.utils.quantization.context import get_kv_cache_strategy
-                from diffulex.utils.quantization.strategies import KVCacheFP8RunningMaxStrategy
-                
                 strategy = get_kv_cache_strategy()
-                if strategy is not None and isinstance(strategy, KVCacheFP8RunningMaxStrategy):
-                    # FP8 quantization: pass scales to metadata
-                    # For static mode: FP8 kernel will handle dequantization internally
-                    # For varlen mode: load_kvcache will handle dequantization
-                    if self.k_scale is None or self.v_scale is None:
-                        raise ValueError("FP8 quantization requires k_scale and v_scale")
-                    
-                    # Pass scale to metadata (FP8 kernel or load_kvcache will handle dequantization)
-                    attn_metadata.k_scale = self.k_scale
-                    attn_metadata.v_scale = self.v_scale
+                if strategy is not None:
+                    # e.g. FP8: pass scales to metadata for kernel / load_kvcache to handle
+                    strategy.maybe_set_attn_metadata_scales(
+                        attn_metadata, k_scale=self.k_scale, v_scale=self.v_scale
+                    )
                 
                 o = dllm_flash_attn_decode(q, k, v, k_cache, v_cache, self.scale, attn_metadata)
             else:
                 # Distinct layout: use varlen mode with load_kvcache
                 from diffulex_kernel import load_kvcache
                 from diffulex.utils.quantization.context import get_kv_cache_strategy
-                from diffulex.utils.quantization.strategies import KVCacheFP8RunningMaxStrategy
-                
                 strategy = get_kv_cache_strategy()
-                if strategy is not None and isinstance(strategy, KVCacheFP8RunningMaxStrategy):
-                    # FP8 quantization: pass scales to metadata for load_kvcache to handle
-                    if self.k_scale is None or self.v_scale is None:
-                        raise ValueError("FP8 quantization requires k_scale and v_scale")
-                    
-                    # Pass scale to metadata (load_kvcache will handle dequantization)
-                    attn_metadata.k_scale = self.k_scale
-                    attn_metadata.v_scale = self.v_scale
+                if strategy is not None:
+                    # e.g. FP8: pass scales to metadata for load_kvcache to handle
+                    strategy.maybe_set_attn_metadata_scales(
+                        attn_metadata, k_scale=self.k_scale, v_scale=self.v_scale
+                    )
                 
                 # Distinct layout uses varlen mode
                 k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)

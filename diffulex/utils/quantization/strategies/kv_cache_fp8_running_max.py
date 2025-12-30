@@ -4,8 +4,10 @@ FP8 KV Cache quantization strategy using running max for scale management.
 
 import torch
 from typing import Optional
+
 from diffulex.utils.quantization.strategy import KVCacheQuantizationStrategy
-from diffulex.utils.quantization.kv_cache_dtype import parse_kv_cache_dtype
+from diffulex.utils.quantization.kv_cache_dtype import parse_kv_cache_dtype, view_fp8_cache
+from diffulex.utils.quantization.registry import register_kv_cache_strategy
 
 
 class KVCacheFP8RunningMaxStrategy(KVCacheQuantizationStrategy):
@@ -26,10 +28,45 @@ class KVCacheFP8RunningMaxStrategy(KVCacheQuantizationStrategy):
     @property
     def name(self) -> str:
         return f"kv_cache_fp8_running_max_{self.dtype_str}"
+
+    @property
+    def kv_cache_format(self) -> str:
+        return "fp8"
+
+    @property
+    def requires_runtime_scales(self) -> bool:
+        return True
     
     def get_storage_dtype(self) -> tuple[torch.dtype, int]:
         """Returns uint8 as storage dtype for FP8 (FP8 values are stored as uint8)."""
         return torch.uint8, 1
+
+    def view_kv_cache_for_kernels(self, cache: torch.Tensor) -> torch.Tensor:
+        # For kernels expecting float8 dtype (e.g. TileLang FP8 decode), keep uint8
+        # storage but return a float8 view tensor.
+        return view_fp8_cache(cache, self.dtype_str)
+
+    def quantize_kv_for_store(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        k_scale: Optional[torch.Tensor],
+        v_scale: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vectorized quantization for KV cache store.
+
+        Args:
+            k/v: [N, H, D] BF16/FP16/FP32
+            k_scale/v_scale: [H] float32
+        Returns:
+            k_q/v_q: [N, H, D] uint8
+        """
+        if k_scale is None or v_scale is None:
+            raise ValueError("FP8 quantization requires k_scale and v_scale")
+        k_q, _ = self.quantize(k, scale=k_scale)
+        v_q, _ = self.quantize(v, scale=v_scale)
+        return k_q, v_q
     
     def compute_scales(self, k: torch.Tensor, v: torch.Tensor,
                       num_kv_heads: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -189,4 +226,14 @@ class KVCacheFP8RunningMaxStrategy(KVCacheQuantizationStrategy):
         k_scale = torch.ones((num_kv_heads,), device=device, dtype=torch.float32)
         v_scale = torch.ones((num_kv_heads,), device=device, dtype=torch.float32)
         return k_scale, v_scale
+
+
+@register_kv_cache_strategy("fp8", "fp8_e4m3", "e4m3")
+def _build_kv_cache_fp8_e4m3() -> KVCacheFP8RunningMaxStrategy:
+    return KVCacheFP8RunningMaxStrategy("fp8_e4m3")
+
+
+@register_kv_cache_strategy("fp8_e5m2", "e5m2")
+def _build_kv_cache_fp8_e5m2() -> KVCacheFP8RunningMaxStrategy:
+    return KVCacheFP8RunningMaxStrategy("fp8_e5m2")
 

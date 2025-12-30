@@ -5,13 +5,15 @@ This module provides factory functions to create quantization strategies from co
 """
 
 from typing import Optional
+
 from diffulex.utils.quantization.context import QuantizationContext
+from diffulex.utils.quantization.config import QuantizationConfig
+from diffulex.utils.quantization.registry import create_attn_q_strategy as _create_attn_q_strategy
+from diffulex.utils.quantization.registry import create_kv_cache_strategy as _create_kv_cache_strategy
 from diffulex.utils.quantization.strategy import KVCacheQuantizationStrategy
-from diffulex.utils.quantization.strategies import (
-    NoQuantizationStrategy,
-    KVCacheBF16Strategy,
-    KVCacheFP8RunningMaxStrategy,
-)
+
+# Ensure built-in strategies are imported so they can register themselves.
+from diffulex.utils.quantization import strategies as _builtin_strategies  # noqa: F401
 
 
 class QuantizationStrategyFactory:
@@ -36,28 +38,8 @@ class QuantizationStrategyFactory:
         Raises:
             ValueError: If dtype is not supported
         """
-        if dtype is None or dtype.lower() == "bf16":
-            return KVCacheBF16Strategy()
-        
-        dtype_lower = dtype.lower()
-        
-        if dtype_lower in ("fp16", "float16"):
-            # TODO: Implement FP16 strategy if needed
-            # For now, use BF16 strategy (no quantization)
-            return KVCacheBF16Strategy()
-        
-        if dtype_lower in ("fp32", "float32"):
-            # TODO: Implement FP32 strategy if needed
-            # For now, use BF16 strategy (no quantization)
-            return KVCacheBF16Strategy()
-        
-        if dtype_lower in ("fp8", "fp8_e4m3", "e4m3"):
-            return KVCacheFP8RunningMaxStrategy("fp8_e4m3")
-        
-        if dtype_lower in ("fp8_e5m2", "e5m2"):
-            return KVCacheFP8RunningMaxStrategy("fp8_e5m2")
-        
-        raise ValueError(f"Unsupported kv_cache_dtype: {dtype}")
+        # NOTE: dtype normalization + compatibility handling lives in the registry.
+        return _create_kv_cache_strategy(dtype or "bf16")
     
     @staticmethod
     def create_from_config(config) -> QuantizationContext:
@@ -74,11 +56,15 @@ class QuantizationStrategyFactory:
         """
         ctx = QuantizationContext.current()
         
+        quant_cfg = QuantizationConfig.from_diffulex_config(config)
+
         # KV Cache strategy
-        kv_cache_dtype = getattr(config, 'kv_cache_dtype', None)
-        if kv_cache_dtype:
-            strategy = QuantizationStrategyFactory.create_kv_cache_strategy(kv_cache_dtype)
-            ctx.set_strategy('kv_cache', strategy)
+        strategy = QuantizationStrategyFactory.create_kv_cache_strategy(quant_cfg.kv_cache.dtype)
+        ctx.set_strategy('kv_cache', strategy)
+
+        # Attention-Q strategy (activation)
+        attn_q_strategy = _create_attn_q_strategy(quant_cfg.activations.attn_q_dtype)
+        ctx.set_strategy('attn_q', attn_q_strategy)
         
         # Future: Weight strategy
         # weight_dtype = getattr(config, 'weight_dtype', None)

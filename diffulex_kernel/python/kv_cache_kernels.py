@@ -136,18 +136,12 @@ def dllm_store_kvcache_kernel_distinct_fp8(
 def _store_kvcache_distinct_fp8(key: torch.Tensor, value: torch.Tensor,
                                 k_cache: torch.Tensor, v_cache: torch.Tensor,
                                 slot_mapping: torch.Tensor,
-                                k_scale: torch.Tensor, v_scale: torch.Tensor) -> None:
+                                k_scale: torch.Tensor, v_scale: torch.Tensor,
+                                *, strategy) -> None:
     """Helper function for FP8 distinct layout store.
     
     Quantizes BF16 key/value to FP8 (uint8 storage) using strategy, then stores to cache.
     """
-    from diffulex.utils.quantization.context import get_kv_cache_strategy
-    from diffulex.utils.quantization.strategies import KVCacheFP8RunningMaxStrategy
-    
-    strategy = get_kv_cache_strategy()
-    if not isinstance(strategy, KVCacheFP8RunningMaxStrategy):
-        raise ValueError(f"Expected KVCacheFP8RunningMaxStrategy, got {type(strategy)}")
-    
     # k_cache: [num_blks, h, hdim // x, blk_sz, x]
     # v_cache: [num_blks, h, hdim, blk_sz]
     NBlks, NHeads, HDim_x, Blk_sz, x = k_cache.shape
@@ -158,24 +152,10 @@ def _store_kvcache_distinct_fp8(key: torch.Tensor, value: torch.Tensor,
     assert HDim == head_dim and NHeads == num_kv_heads
     assert N == slot_mapping.numel()
     
-    # Quantize key and value using strategy (same as unified layout)
-    key_quantized_list = []
-    value_quantized_list = []
-    for head_idx in range(num_kv_heads):
-        key_head = key[:, head_idx, :]  # [N, head_dim]
-        value_head = value[:, head_idx, :]  # [N, head_dim]
-        k_scale_head = k_scale[head_idx:head_idx+1]  # [1]
-        v_scale_head = v_scale[head_idx:head_idx+1]  # [1]
-        
-        key_quant_head, _ = strategy.quantize(key_head, k_scale_head)  # [N, head_dim], uint8
-        value_quant_head, _ = strategy.quantize(value_head, v_scale_head)  # [N, head_dim], uint8
-        
-        key_quantized_list.append(key_quant_head)
-        value_quantized_list.append(value_quant_head)
-    
-    # Concatenate heads: [N, head_dim] * num_kv_heads -> [N, D]
-    key_quantized = torch.cat(key_quantized_list, dim=1).contiguous()  # [N, D]
-    value_quantized = torch.cat(value_quantized_list, dim=1).contiguous()  # [N, D]
+    # Vectorized quantization: [N, H, D] -> [N, H, D] uint8, then flatten to [N, H*D]
+    k_q, v_q = strategy.quantize_kv_for_store(key, value, k_scale=k_scale, v_scale=v_scale)
+    key_quantized = k_q.reshape(N, D).contiguous()
+    value_quantized = v_q.reshape(N, D).contiguous()
     
     assert key_quantized.dtype == torch.uint8, f"Expected uint8, got {key_quantized.dtype}"
     assert value_quantized.dtype == torch.uint8, f"Expected uint8, got {value_quantized.dtype}"
@@ -250,44 +230,19 @@ def dllm_store_kvcache_kernel_unified_fp8(
 def _store_kvcache_unified_fp8(key: torch.Tensor, value: torch.Tensor,
                                 k_cache: torch.Tensor, v_cache: torch.Tensor,
                                 slot_mapping: torch.Tensor,
-                                k_scale: torch.Tensor, v_scale: torch.Tensor) -> None:
+                                k_scale: torch.Tensor, v_scale: torch.Tensor,
+                                *, strategy) -> None:
     """Helper function for FP8 unified layout store.
     
     Quantizes BF16 key/value to FP8 (uint8 storage) using strategy, then stores to cache.
     """
-    from diffulex.utils.quantization.context import get_kv_cache_strategy
-    from diffulex.utils.quantization.strategies import KVCacheFP8RunningMaxStrategy
-    
-    strategy = get_kv_cache_strategy()
-    if not isinstance(strategy, KVCacheFP8RunningMaxStrategy):
-        raise ValueError(f"Expected KVCacheFP8RunningMaxStrategy, got {type(strategy)}")
-    
     N, num_kv_heads, head_dim = key.shape
     D = num_kv_heads * head_dim
     
-    # Quantize key and value using strategy
-    # strategy.quantize expects [seq_len, num_heads, head_dim] and [num_heads] scale
-    key_quantized_list = []
-    value_quantized_list = []
-    for head_idx in range(num_kv_heads):
-        key_head = key[:, head_idx, :]  # [N, head_dim]
-        value_head = value[:, head_idx, :]  # [N, head_dim]
-        k_scale_head = k_scale[head_idx:head_idx+1]  # [1]
-        v_scale_head = v_scale[head_idx:head_idx+1]  # [1]
-        
-        key_quant_head, _ = strategy.quantize(key_head, k_scale_head)  # [N, head_dim], uint8
-        value_quant_head, _ = strategy.quantize(value_head, v_scale_head)  # [N, head_dim], uint8
-        
-        key_quantized_list.append(key_quant_head)
-        value_quantized_list.append(value_quant_head)
-    
-    # Concatenate heads: [N, head_dim] * num_kv_heads -> [N, D]
-    key_quantized = torch.cat(key_quantized_list, dim=1)  # [N, D]
-    value_quantized = torch.cat(value_quantized_list, dim=1)  # [N, D]
-    
-    # Ensure contiguous and correct dtype (uint8)
-    key_quantized = key_quantized.contiguous()
-    value_quantized = value_quantized.contiguous()
+    # Vectorized quantization: [N, H, D] -> [N, H, D] uint8, then flatten to [N, H*D]
+    k_q, v_q = strategy.quantize_kv_for_store(key, value, k_scale=k_scale, v_scale=v_scale)
+    key_quantized = k_q.reshape(N, D).contiguous()
+    value_quantized = v_q.reshape(N, D).contiguous()
     
     assert key_quantized.dtype == torch.uint8, f"Expected uint8, got {key_quantized.dtype}"
     assert value_quantized.dtype == torch.uint8, f"Expected uint8, got {value_quantized.dtype}"
@@ -432,8 +387,8 @@ def load_kvcache_kernel_bf16(k_cache_ptr, v_cache_ptr,
 
 
 def _load_kvcache_bf16(k_cache: torch.Tensor, v_cache: torch.Tensor,
-                       attn_metadata: AttnMetaDataBase,
-                       k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                 attn_metadata: AttnMetaDataBase,
+                 k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Helper function for BF16 load.
     
     Supports both unified and distinct layouts:
@@ -538,28 +493,25 @@ def store_kvcache_unified_layout(key: torch.Tensor, value: torch.Tensor,
     Dynamically selects the appropriate kernel based on quantization strategy from context.
     """
     from diffulex.utils.quantization.context import get_kv_cache_strategy
-    from diffulex.utils.quantization.strategies import (
-        NoQuantizationStrategy,
-        KVCacheBF16Strategy,
-        KVCacheFP8RunningMaxStrategy,
-    )
-    
     strategy = get_kv_cache_strategy()
     if strategy is None:
-        strategy = NoQuantizationStrategy()
-    
-    # 根据策略类型选择kernel
-    if isinstance(strategy, (KVCacheBF16Strategy, NoQuantizationStrategy)):
-        # BF16路径：无量化，直接存储
         _store_kvcache_unified_bf16(key, value, k_cache, v_cache, slot_mapping)
-    elif isinstance(strategy, KVCacheFP8RunningMaxStrategy):
-        # FP8路径：量化后存储
+        return
+
+    fmt = getattr(strategy, "kv_cache_format", "bf16")
+    if fmt == "bf16":
+        _store_kvcache_unified_bf16(key, value, k_cache, v_cache, slot_mapping)
+        return
+    if fmt == "fp8":
         if attn_metadata.k_scale is None or attn_metadata.v_scale is None:
             raise ValueError("FP8 quantization requires k_scale and v_scale in metadata")
-        _store_kvcache_unified_fp8(key, value, k_cache, v_cache, slot_mapping,
-                                   attn_metadata.k_scale, attn_metadata.v_scale)
-    else:
-        raise ValueError(f"Unsupported quantization strategy for unified layout: {type(strategy)}")
+        _store_kvcache_unified_fp8(
+            key, value, k_cache, v_cache, slot_mapping,
+            attn_metadata.k_scale, attn_metadata.v_scale,
+            strategy=strategy,
+        )
+        return
+    raise ValueError(f"Unsupported kv_cache_format={fmt!r} for unified layout (strategy={type(strategy)})")
 
 
 def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor, 
@@ -570,28 +522,25 @@ def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor,
     Dynamically selects the appropriate kernel based on quantization strategy from context.
     """
     from diffulex.utils.quantization.context import get_kv_cache_strategy
-    from diffulex.utils.quantization.strategies import (
-        NoQuantizationStrategy,
-        KVCacheBF16Strategy,
-        KVCacheFP8RunningMaxStrategy,
-    )
-    
     strategy = get_kv_cache_strategy()
     if strategy is None:
-        strategy = NoQuantizationStrategy()
-    
-    # 根据策略类型选择kernel
-    if isinstance(strategy, (KVCacheBF16Strategy, NoQuantizationStrategy)):
-        # BF16路径：无量化，直接存储
         _store_kvcache_distinct_bf16(key, value, k_cache, v_cache, slot_mapping)
-    elif isinstance(strategy, KVCacheFP8RunningMaxStrategy):
-        # FP8路径：量化后存储
+        return
+
+    fmt = getattr(strategy, "kv_cache_format", "bf16")
+    if fmt == "bf16":
+        _store_kvcache_distinct_bf16(key, value, k_cache, v_cache, slot_mapping)
+        return
+    if fmt == "fp8":
         if attn_metadata.k_scale is None or attn_metadata.v_scale is None:
             raise ValueError("FP8 quantization requires k_scale and v_scale in metadata")
-        _store_kvcache_distinct_fp8(key, value, k_cache, v_cache, slot_mapping,
-                                    attn_metadata.k_scale, attn_metadata.v_scale)
-    else:
-        raise ValueError(f"Unsupported quantization strategy for distinct layout: {type(strategy)}")
+        _store_kvcache_distinct_fp8(
+            key, value, k_cache, v_cache, slot_mapping,
+            attn_metadata.k_scale, attn_metadata.v_scale,
+            strategy=strategy,
+        )
+        return
+    raise ValueError(f"Unsupported kv_cache_format={fmt!r} for distinct layout (strategy={type(strategy)})")
 
 
 def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
@@ -604,11 +553,9 @@ def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
     - Distinct: k_cache [num_blks, h, hdim // x, blk_sz, x], v_cache [num_blks, h, hdim, blk_sz]
     """
     from diffulex.utils.quantization.context import get_kv_cache_strategy
-    from diffulex.utils.quantization.strategies import KVCacheFP8RunningMaxStrategy
-    
     strategy = get_kv_cache_strategy()
-    if not isinstance(strategy, KVCacheFP8RunningMaxStrategy):
-        raise ValueError(f"Expected KVCacheFP8RunningMaxStrategy, got {type(strategy)}")
+    if strategy is None or getattr(strategy, "kv_cache_format", "bf16") != "fp8":
+        raise ValueError(f"Expected kv_cache_format='fp8', got strategy={type(strategy)}")
     
     # Get scales from metadata
     if attn_metadata.k_scale is None or attn_metadata.v_scale is None:
@@ -626,9 +573,9 @@ def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
         # Unified layout: [num_blocks, page_size, num_kv_heads, head_dim]
         N_BLOCKS, PAGE_SIZE, H_KV, HEAD_DIM = k_cache.shape
         
-        # Dequantize cache: view uint8 as FP8 dtype, then dequantize
-        k_cache_fp8 = k_cache.view(strategy.spec.fp8_view_dtype)  # View as FP8
-        v_cache_fp8 = v_cache.view(strategy.spec.fp8_view_dtype)  # View as FP8
+        # Dequantize cache: view uint8 storage as FP8 dtype, then dequantize
+        k_cache_fp8 = strategy.view_kv_cache_for_kernels(k_cache)
+        v_cache_fp8 = strategy.view_kv_cache_for_kernels(v_cache)
         
         # Convert to float32 for dequantization
         k_cache_fp32 = k_cache_fp8.float()  # [num_blocks, page_size, num_kv_heads, head_dim]
@@ -648,9 +595,9 @@ def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
         # v_cache: [num_blks, h, hdim, blk_sz]
         N_BLOCKS, H_KV = k_cache.shape[0], k_cache.shape[1]
         
-        # Dequantize cache: view uint8 as FP8 dtype, then dequantize
-        k_cache_fp8 = k_cache.view(strategy.spec.fp8_view_dtype)  # View as FP8
-        v_cache_fp8 = v_cache.view(strategy.spec.fp8_view_dtype)  # View as FP8
+        # Dequantize cache: view uint8 storage as FP8 dtype, then dequantize
+        k_cache_fp8 = strategy.view_kv_cache_for_kernels(k_cache)
+        v_cache_fp8 = strategy.view_kv_cache_for_kernels(v_cache)
         
         # Convert to float32 for dequantization
         k_cache_fp32 = k_cache_fp8.float()
@@ -680,22 +627,13 @@ def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,
     Dynamically selects the appropriate kernel based on quantization strategy from context.
     """
     from diffulex.utils.quantization.context import get_kv_cache_strategy
-    from diffulex.utils.quantization.strategies import (
-        NoQuantizationStrategy,
-        KVCacheBF16Strategy,
-        KVCacheFP8RunningMaxStrategy,
-    )
-    
     strategy = get_kv_cache_strategy()
     if strategy is None:
-        strategy = NoQuantizationStrategy()
-    
-    # 根据策略类型选择kernel
-    if isinstance(strategy, (KVCacheBF16Strategy, NoQuantizationStrategy)):
-        # BF16路径：直接加载
         return _load_kvcache_bf16(k_cache, v_cache, attn_metadata, k_new, v_new)
-    elif isinstance(strategy, KVCacheFP8RunningMaxStrategy):
-        # FP8路径：反量化后加载（Python层显式反量化）
+
+    fmt = getattr(strategy, "kv_cache_format", "bf16")
+    if fmt == "bf16":
+        return _load_kvcache_bf16(k_cache, v_cache, attn_metadata, k_new, v_new)
+    if fmt == "fp8":
         return _load_kvcache_fp8(k_cache, v_cache, attn_metadata, k_new, v_new)
-    else:
-        raise ValueError(f"Unsupported quantization strategy for load: {type(strategy)}")
+    raise ValueError(f"Unsupported kv_cache_format={fmt!r} for load (strategy={type(strategy)})")

@@ -18,6 +18,7 @@ from diffulex.attention.metadata import AttnMetaDataBase, is_warming_up
 
 
 kernel_config = None
+kernel_config_bf16_q_fp8_kv_decode = None
 
 
 @tilelang.autotune(configs=build_configs())
@@ -347,11 +348,12 @@ def dllm_flash_attn_decode_kernel(
     return kernel
 
 
+@tilelang.autotune(configs=build_configs())
 @tilelang.jit(
     out_idx=[-1], 
     pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,},
 )
-def dllm_flash_attn_decode_kernel_fp8(
+def dllm_flash_attn_decode_kernel_bf16_q_fp8_kv(
     NUM_SEQS: int,
     NUM_GROUPS: int,
     NUM_PAGE_BLOCKS: int,
@@ -401,7 +403,9 @@ def dllm_flash_attn_decode_kernel_fp8(
             K_shared = T.alloc_shared([BLOCK_N, HEAD_DIM], DTYPE)
             V_shared = T.alloc_shared([BLOCK_N, HEAD_DIM], DTYPE)
             O_shared = T.alloc_shared([BLOCK_M, HEAD_DIM], DTYPE)
-            # BF16 shared memory buffers (after dequantization)
+            
+            # KV cache shared staging buffers (BF16):
+            # HBM(FP8) -> T.copy (implicit cast) -> shared(BF16) -> GEMM
             K_Cache_shared_bf16 = T.alloc_shared([PAGE_BLOCK_SIZE, HEAD_DIM], DTYPE)
             V_Cache_shared_bf16 = T.alloc_shared([PAGE_BLOCK_SIZE, HEAD_DIM], DTYPE)
             
@@ -439,8 +443,6 @@ def dllm_flash_attn_decode_kernel_fp8(
             T.copy(Q[q_start_idx : q_start_idx + BLOCK_M, head_idx, :], Q_shared)
             
             T.fill(acc_output, 0)
-            T.fill(acc_score_kv, 0)
-            T.fill(acc_score_kvcache, 0)
             T.fill(log_sum, 0)
             T.fill(scores_max, -T.infinity(ACCUM_DTYPE))
             
@@ -450,26 +452,23 @@ def dllm_flash_attn_decode_kernel_fp8(
             for page_block_idx_local in T.Pipelined(MAX_SEQ_NUM_BLOCKS, num_stages=NUM_STAGES):
                 page_block_idx_global = block_tables[seq_idx, page_block_idx_local]
                 if page_block_idx_global >= 0:
-                    # Load FP8 K_Cache and cast to BF16 in shared memory.
-                    # Note: we intentionally do NOT apply K_Scale here; instead, we fuse it into scores.
+                    # Step 1: Load FP8 K_Cache, implicit cast to BF16 (vectorized path).
+                    # K_Scale will be applied on scores (much cheaper than scaling K elementwise).
                     T.copy(K_Cache[page_block_idx_global, :, kv_head_idx, :], K_Cache_shared_bf16)
-
-                    # Compute attention scores (unscaled) using BF16-cast cache
-                    for i, j in T.Parallel(BLOCK_M, PAGE_BLOCK_SIZE):
-                        acc_score_kvcache[i, j] = 0
-                    T.gemm(Q_shared, K_Cache_shared_bf16, acc_score_kvcache, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-
-                    # Fuse K scale on scores: (Q @ (K_fp8 * s_k)^T) == (Q @ K_fp8^T) * s_k
-                    for i, j in T.Parallel(BLOCK_M, PAGE_BLOCK_SIZE):
-                        acc_score_kvcache[i, j] *= K_Scale[kv_head_idx]
-
-                    # Apply attention mask AFTER scaling so the mask is not scaled.
+                    
+                    # Initialize scores with mask, then GEMM accumulates into it (masked entries remain ~-1e9).
                     for i, j in T.Parallel(BLOCK_M, PAGE_BLOCK_SIZE):
                         acc_score_kvcache[i, j] = T.if_then_else(
                             (i >= cur_q_seqlen or page_block_idx_local * PAGE_BLOCK_SIZE + j >= cur_context_len),
                             -1e9,
-                            acc_score_kvcache[i, j],
+                            0,
                         )
+                    
+                    # Compute attention scores
+                    T.gemm(Q_shared, K_Cache_shared_bf16, acc_score_kvcache, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                    # Apply per-head K scale on scores: (Q·(K*ks)) == (Q·K) * ks
+                    for i, j in T.Parallel(BLOCK_M, PAGE_BLOCK_SIZE):
+                        acc_score_kvcache[i, j] *= K_Scale[kv_head_idx]
                     
                     # Compute online softmax
                     T.copy(scores_max, scores_max_prev)
@@ -488,22 +487,19 @@ def dllm_flash_attn_decode_kernel_fp8(
                     for i in T.Parallel(BLOCK_M):
                         log_sum[i] = log_sum[i] * scores_scale[i] + scores_sum[i]
                         
-                    # Fuse V scale on cache-branch numerator only:
-                    # sum_j w_j * (V_fp8 * s_v) == s_v * sum_j w_j * V_fp8
-                    # Do this after log_sum update so the denominator stays unscaled.
+                    # Cast weights to BF16 for V GEMM, fuse per-head V scale here:
+                    # (softmax * (V*vs)) == ((softmax*vs) · V)
                     for i, j in T.Parallel(BLOCK_M, PAGE_BLOCK_SIZE):
-                        acc_score_kvcache[i, j] *= V_Scale[kv_head_idx]
-
-                    T.copy(acc_score_kvcache, acc_score_kvcache_cast)
+                        acc_score_kvcache_cast[i, j] = (acc_score_kvcache[i, j] * V_Scale[kv_head_idx]).astype(T.bfloat16)
                     
                     # Scale previous output accumulator
                     for i, j in T.Parallel(BLOCK_M, HEAD_DIM):
                         acc_output[i, j] *= scores_scale[i]
                     
-                    # Load FP8 V_Cache and cast to BF16 in shared memory (no scale here; scale fused above).
+                    # Step 2: Load FP8 V_Cache, implicit cast to BF16 (vectorized path).
                     T.copy(V_Cache[page_block_idx_global, :, kv_head_idx, :], V_Cache_shared_bf16)
                     
-                    # Accumulate current V_cache contribution using dequantized BF16 cache
+                    # Accumulate current V_cache contribution using BF16 V_Cache shared buffer
                     T.gemm(acc_score_kvcache_cast, V_Cache_shared_bf16, acc_output, policy=T.GemmWarpPolicy.FullRow)
                 
                 if page_block_idx_local == MAX_SEQ_NUM_BLOCKS - 1:
@@ -846,7 +842,7 @@ def _dllm_flash_attn_decode_bf16(
                                       softmax_scale=scale, block_table=None)
 
 
-def _dllm_flash_attn_decode_fp8(
+def _dllm_flash_attn_decode_bf16_q_fp8_kv(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -855,12 +851,21 @@ def _dllm_flash_attn_decode_fp8(
     scale: float,
     attn_metadata: AttnMetaDataBase
 ) -> torch.Tensor:
-    """FP8 decode helper function that uses FP8 kernel with internal dequantization."""
+    """BF16 Q + FP8 KV decode helper function that uses BF16-Q/FP8-KV kernel with internal dequantization."""
     if attn_metadata.k_scale is None or attn_metadata.v_scale is None:
-        raise ValueError("FP8 decode requires k_scale and v_scale in metadata")
+        raise ValueError("FP8 KV decode requires k_scale and v_scale in metadata")
+
+    # KV cache is stored as uint8 for FP8, but TileLang expects float8 view dtype.
+    from diffulex.utils.quantization.context import get_kv_cache_strategy
+    strategy = get_kv_cache_strategy()
+    if strategy is None or getattr(strategy, "kv_cache_format", "bf16") != "fp8":
+        raise ValueError(f"Expected kv_cache_format='fp8', got strategy={type(strategy)}")
+    k_cache = strategy.view_kv_cache_for_kernels(k_cache)
+    v_cache = strategy.view_kv_cache_for_kernels(v_cache)
     
     if attn_metadata.decode_mode == "static":
-        decode_kernel = dllm_flash_attn_decode_kernel_fp8(
+        global kernel_config_bf16_q_fp8_kv_decode
+        common_args = (
             attn_metadata.num_seqs,
             q.shape[1] // k.shape[1],
             k_cache.shape[0],
@@ -872,9 +877,29 @@ def _dllm_flash_attn_decode_fp8(
             attn_metadata.diffusion_block_size,
             attn_metadata.block_tables.shape[1],
             attn_metadata.page_block_size,
-            **kernel_config
         )
-        
+
+        # BF16-Q/FP8-KV decode needs its own autotuned config; do not reuse prefill/BF16 config.
+        if is_warming_up() or kernel_config_bf16_q_fp8_kv_decode is None:
+            with set_autotune_inputs([
+                q, k, v,
+                k_cache, v_cache,
+                attn_metadata.k_scale,
+                attn_metadata.v_scale,
+                attn_metadata.block_tables,
+                attn_metadata.context_lens,
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.cu_seqlens_k,
+                attn_metadata.max_seqlen_q,
+            ]):
+                decode_kernel = dllm_flash_attn_decode_kernel_bf16_q_fp8_kv(*common_args)
+            kernel_config_bf16_q_fp8_kv_decode = decode_kernel.config
+        else:
+            decode_kernel = dllm_flash_attn_decode_kernel_bf16_q_fp8_kv(
+                *common_args,
+                **kernel_config_bf16_q_fp8_kv_decode,
+            )
+
         return decode_kernel(
             q, k, v, k_cache, v_cache,
             attn_metadata.k_scale,  # Pass K scale
@@ -916,27 +941,31 @@ def dllm_flash_attn_prefill(
     Returns:
         Output tensor [Q_LEN, NUM_HEADS, HEAD_DIM]
     """
-    from diffulex.utils.quantization.context import get_kv_cache_strategy
-    from diffulex.utils.quantization.strategies import (
-        NoQuantizationStrategy,
-        KVCacheBF16Strategy,
-        KVCacheFP8RunningMaxStrategy,
+    from diffulex.utils.quantization.context import get_kv_cache_strategy, get_attn_q_strategy
+    kv_strategy = get_kv_cache_strategy()
+    kv_fmt = getattr(kv_strategy, "kv_cache_format", "bf16") if kv_strategy is not None else "bf16"
+
+    q_strategy = get_attn_q_strategy()
+    q_fmt = getattr(q_strategy, "attn_q_format", "bf16") if q_strategy is not None else "bf16"
+
+    # Allow activation strategy to populate metadata (e.g. q_scale) and/or transform Q.
+    if q_strategy is not None:
+        q_scale = q_strategy.maybe_compute_q_scale(q, device=q.device)
+        q_strategy.maybe_set_attn_metadata_q_scale(attn_metadata, q_scale=q_scale)
+        q = q_strategy.quantize_q_for_kernel(q, q_scale=q_scale)
+
+    # Prefill currently uses BF16 kernels for all formats (FP8 prefill kernel TBD).
+    if q_fmt == "bf16" and kv_fmt in ("bf16", "fp8"):
+        return _dllm_flash_attn_prefill_bf16(q, k, v, scale, attn_metadata)
+    if q_fmt == "fp8":
+        raise NotImplementedError(
+            "attn_q_dtype='fp8' is wired for dynamic dispatch but the matching attention kernels "
+            "are not implemented yet. Please keep attn_q_dtype='bf16' for now."
+        )
+    raise ValueError(
+        f"Unsupported attn_q_format={q_fmt!r} / kv_cache_format={kv_fmt!r} for prefill "
+        f"(q_strategy={type(q_strategy)}, kv_strategy={type(kv_strategy)})"
     )
-    
-    strategy = get_kv_cache_strategy()
-    if strategy is None:
-        strategy = NoQuantizationStrategy()
-    
-    # 根据策略类型选择kernel
-    if isinstance(strategy, (KVCacheBF16Strategy, NoQuantizationStrategy)):
-        # BF16路径：使用BF16 kernel
-        return _dllm_flash_attn_prefill_bf16(q, k, v, scale, attn_metadata)
-    elif isinstance(strategy, KVCacheFP8RunningMaxStrategy):
-        # FP8路径：暂时使用BF16 kernel（后续实现FP8 kernel）
-        # Note: FP8 prefill kernel will be implemented in the future
-        return _dllm_flash_attn_prefill_bf16(q, k, v, scale, attn_metadata)
-    else:
-        raise ValueError(f"Unsupported quantization strategy for prefill: {type(strategy)}")
 
 
 def dllm_flash_attn_decode(
@@ -965,28 +994,32 @@ def dllm_flash_attn_decode(
     
     Note:
         For FP8 strategy:
-        - Unified layout static mode: dequantization is handled in attn_impl.py before calling this function
-        - Unified layout varlen mode: dequantization is handled by load_kvcache
-        - Distinct layout: dequantization is handled by load_kvcache
-        So FP8 strategy can temporarily use BF16 kernel.
+        - Unified layout static mode: dequantization + scale fusion are handled inside the TileLang FP8 decode kernel
+        - Unified layout varlen mode: dequantization is handled by load_kvcache (Python path)
+        - Distinct layout: dequantization is handled by load_kvcache (Python path)
     """
-    from diffulex.utils.quantization.context import get_kv_cache_strategy
-    from diffulex.utils.quantization.strategies import (
-        NoQuantizationStrategy,
-        KVCacheBF16Strategy,
-        KVCacheFP8RunningMaxStrategy,
-    )
-    
-    strategy = get_kv_cache_strategy()
-    if strategy is None:
-        strategy = NoQuantizationStrategy()
-    
-    # 根据策略类型选择kernel
-    if isinstance(strategy, (KVCacheBF16Strategy, NoQuantizationStrategy)):
-        # BF16路径：使用BF16 kernel
+    from diffulex.utils.quantization.context import get_kv_cache_strategy, get_attn_q_strategy
+    kv_strategy = get_kv_cache_strategy()
+    kv_fmt = getattr(kv_strategy, "kv_cache_format", "bf16") if kv_strategy is not None else "bf16"
+
+    q_strategy = get_attn_q_strategy()
+    q_fmt = getattr(q_strategy, "attn_q_format", "bf16") if q_strategy is not None else "bf16"
+
+    if q_strategy is not None:
+        q_scale = q_strategy.maybe_compute_q_scale(q, device=q.device)
+        q_strategy.maybe_set_attn_metadata_q_scale(attn_metadata, q_scale=q_scale)
+        q = q_strategy.quantize_q_for_kernel(q, q_scale=q_scale)
+
+    if q_fmt == "bf16" and kv_fmt == "bf16":
         return _dllm_flash_attn_decode_bf16(q, k, v, k_cache, v_cache, scale, attn_metadata)
-    elif isinstance(strategy, KVCacheFP8RunningMaxStrategy):
-        # FP8路径：使用FP8 kernel（在kernel内部进行转换）
-        return _dllm_flash_attn_decode_fp8(q, k, v, k_cache, v_cache, scale, attn_metadata)
-    else:
-        raise ValueError(f"Unsupported quantization strategy for decode: {type(strategy)}")
+    if q_fmt == "bf16" and kv_fmt == "fp8":
+        return _dllm_flash_attn_decode_bf16_q_fp8_kv(q, k, v, k_cache, v_cache, scale, attn_metadata)
+    if q_fmt == "fp8":
+        raise NotImplementedError(
+            "attn_q_dtype='fp8' is wired for dynamic dispatch but the matching attention kernels "
+            "are not implemented yet. Please keep attn_q_dtype='bf16' for now."
+        )
+    raise ValueError(
+        f"Unsupported attn_q_format={q_fmt!r} / kv_cache_format={kv_fmt!r} for decode "
+        f"(q_strategy={type(q_strategy)}, kv_strategy={type(kv_strategy)})"
+    )

@@ -73,6 +73,44 @@ for output in outputs:
 
 For more examples, check out the [examples](examples/) directory.
 
+## KV Cache Quantization
+
+Diffulex currently supports **KV cache quantization** via the config field `kv_cache_dtype`.
+
+- **How to enable**: pass `kv_cache_dtype` when constructing `Diffulex`.
+
+```python
+llm = Diffulex(
+    model_path,
+    tensor_parallel_size=1,
+    data_parallel_size=1,
+    kv_cache_dtype="fp8",  # "bf16" (default) | "fp8" | "fp8_e4m3" | "fp8_e5m2"
+)
+```
+
+- **Implementation notes**:
+  - Quantization logic lives in `diffulex/utils/quantization`.
+  - Runtime dispatch is **capability-based** (e.g. `kv_cache_format`, whether scales are required), so the engine/kernel code no longer hard-codes concrete strategy classes.
+  - FP8 stores KV cache as **uint8 storage** with a **float8 view** for kernels; per-head scales are propagated through `AttnMetaDataBase.k_scale/v_scale`.
+
+- **Extend with new strategies**:
+  - Add a new `KVCacheQuantizationStrategy` implementation under `diffulex/utils/quantization/strategies/`.
+  - Register it via `@register_kv_cache_strategy(...)` so `kv_cache_dtype` strings map to your strategy.
+
+## Attention-Q Quantization (Experimental)
+
+Diffulex also exposes an **experimental** knob for Attention-Q activation quantization:
+
+```python
+llm = Diffulex(
+    model_path,
+    attn_q_dtype="bf16",  # default; "fp8" is wired for dispatch but kernels are not implemented yet
+)
+```
+
+When `attn_q_dtype="fp8"` is selected, Diffulex will route through the dynamic dispatch path and
+raise `NotImplementedError` until the corresponding attention kernels are implemented.
+
 ## Upcoming Features
 
 Check our [Diffulex v0.0.1 release plan](https://github.com/zhijie-group/Diffulex/issues/14) for upcoming features.

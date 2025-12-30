@@ -5,6 +5,7 @@ BF16 KV Cache quantization strategy (no actual quantization, just storage format
 import torch
 from typing import Optional
 from diffulex.utils.quantization.strategy import KVCacheQuantizationStrategy
+from diffulex.utils.quantization.registry import register_kv_cache_strategy
 
 
 class KVCacheBF16Strategy(KVCacheQuantizationStrategy):
@@ -49,4 +50,12 @@ class KVCacheBF16Strategy(KVCacheQuantizationStrategy):
     def get_scale_shape(self, original_shape: tuple[int, ...], num_kv_heads: int, **kwargs) -> tuple[int, ...]:
         """No scale needed for BF16."""
         return (0,)  # Empty shape
+
+
+# NOTE: fp16/fp32 are currently routed to the BF16 kernels in Diffulex.
+# Keeping them registered avoids breaking older configs while we add
+# true fp16/fp32 KV-cache kernels in the future.
+@register_kv_cache_strategy("bf16", "bfloat16", "fp16", "float16", "fp32", "float32")
+def _build_kv_cache_bf16() -> KVCacheBF16Strategy:
+    return KVCacheBF16Strategy()
 

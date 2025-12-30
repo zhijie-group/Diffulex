@@ -5,8 +5,21 @@ This module defines abstract base classes for different types of quantization st
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
+
 import torch
+
+
+class _AttnMetaDataLike(Protocol):
+    """A minimal protocol for attention metadata used by Diffulex runtime.
+
+    We avoid importing `diffulex.attention.metadata` here to reduce the chance
+    of circular imports.
+    """
+
+    k_scale: Optional[torch.Tensor]
+    v_scale: Optional[torch.Tensor]
+    q_scale: Optional[torch.Tensor]
 
 
 class QuantizationStrategy(ABC):
@@ -71,9 +84,24 @@ class QuantizationStrategy(ABC):
         """
         pass
 
+    # ---- Optional capability flags / helpers (non-abstract) ----
+    # These helpers are used to avoid hard-coding isinstance(...) checks in the runtime.
+    @property
+    def requires_runtime_scales(self) -> bool:
+        """Whether this strategy requires runtime scale tensors to be allocated/updated."""
+        return False
+
 
 class KVCacheQuantizationStrategy(QuantizationStrategy):
     """KV Cache quantization strategy interface (extended interface)."""
+
+    # NOTE: We use a small string tag for dispatch instead of importing enums everywhere.
+    # Known values:
+    # - "bf16": no quantization, cache stored as bf16
+    # - "fp8": FP8 cache stored as uint8 (storage) with float8 view for kernels
+    @property
+    def kv_cache_format(self) -> str:
+        return "bf16"
     
     @abstractmethod
     def compute_scales(self, k: torch.Tensor, v: torch.Tensor, 
@@ -129,6 +157,53 @@ class KVCacheQuantizationStrategy(QuantizationStrategy):
         # Default implementation: return None (no scales needed)
         return None, None
 
+    # ---- Diffulex integration helpers (non-abstract) ----
+    @property
+    def requires_kv_cache_scales(self) -> bool:
+        """Whether KV cache kernels / decode require per-head scales."""
+        return self.requires_runtime_scales
+
+    def maybe_set_attn_metadata_scales(
+        self,
+        attn_metadata: _AttnMetaDataLike,
+        *,
+        k_scale: Optional[torch.Tensor],
+        v_scale: Optional[torch.Tensor],
+    ) -> None:
+        """Populate `attn_metadata.k_scale/v_scale` when needed."""
+        if not self.requires_kv_cache_scales:
+            return
+        if k_scale is None or v_scale is None:
+            raise ValueError(
+                f"{self.name} requires k_scale/v_scale but got "
+                f"k_scale={k_scale is not None}, v_scale={v_scale is not None}"
+            )
+        attn_metadata.k_scale = k_scale
+        attn_metadata.v_scale = v_scale
+
+    def view_kv_cache_for_kernels(self, cache: torch.Tensor) -> torch.Tensor:
+        """Return a view of cache suitable for kernel consumption.
+
+        - BF16 strategies: return as-is
+        - FP8 strategies: subclasses may return a float8 view while keeping uint8 storage
+        """
+        return cache
+
+    def quantize_kv_for_store(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        k_scale: Optional[torch.Tensor],
+        v_scale: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize K/V for KV cache store (optional helper).
+
+        Returns:
+            (k_quantized, v_quantized): Usually uint8 tensors for FP8 strategies.
+        """
+        raise NotImplementedError(f"{self.name} does not implement quantize_kv_for_store")
+
 
 class WeightQuantizationStrategy(QuantizationStrategy):
     """Weight quantization strategy interface (for future extension)."""
@@ -161,4 +236,56 @@ class WeightQuantizationStrategy(QuantizationStrategy):
             Dequantized weight tensor.
         """
         pass
+
+
+class AttnQQuantizationStrategy(QuantizationStrategy):
+    """Attention-Q quantization strategy interface (activation quantization)."""
+
+    @property
+    def attn_q_format(self) -> str:
+        """Small tag used for kernel dispatch.
+
+        Known values:
+        - "bf16": Q remains BF16 (default)
+        - "fp8": Q is FP8 (kernel not implemented yet; placeholder)
+        """
+        return "bf16"
+
+    @property
+    def requires_q_scales(self) -> bool:
+        return self.requires_runtime_scales
+
+    def maybe_set_attn_metadata_q_scale(
+        self,
+        attn_metadata: _AttnMetaDataLike,
+        *,
+        q_scale: Optional[torch.Tensor],
+    ) -> None:
+        """Populate `attn_metadata.q_scale` when needed."""
+        if not self.requires_q_scales:
+            return
+        if q_scale is None:
+            raise ValueError(f"{self.name} requires q_scale but got None")
+        attn_metadata.q_scale = q_scale
+
+    def maybe_compute_q_scale(
+        self,
+        q: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Optionally compute Q scale tensor for the current call."""
+        return None
+
+    def quantize_q_for_kernel(
+        self,
+        q: torch.Tensor,
+        *,
+        q_scale: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Return a Q tensor to be consumed by the chosen attention kernel.
+
+        Default behavior: no-op (returns BF16/FP16/FP32 Q as-is).
+        """
+        return q
 
