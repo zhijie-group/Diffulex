@@ -167,3 +167,53 @@ def test_linear_int8_w8a16_lazy_cache():
     assert len(strategy._weight_cache) == 0
 
 
+def test_w8a16_tilelang_kernel_correctness():
+    """Test that W8A16 TileLang kernel produces correct results (if available)."""
+    from diffulex.utils.quantization.registry import create_linear_strategy
+    import torch
+
+    strategy = create_linear_strategy(weight_dtype="int8", act_dtype="bf16")
+    
+    # Skip test if TileLang kernel is not available
+    try:
+        from diffulex_kernel.python.linear_kernels import w8a16_gemm
+        tilelang_available = True
+    except ImportError:
+        tilelang_available = False
+        import pytest
+        pytest.skip("TileLang kernel not available")
+    
+    if not tilelang_available:
+        return
+    
+    # Create test data
+    M, N, K = 128, 256, 512
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    
+    # Quantize weight
+    quantized_weight, scales = strategy.quantize(weight)
+    quantized_weight = quantized_weight.to(device="cuda")
+    scales = scales.to(device="cuda")
+    
+    # Compute reference output (Python implementation)
+    ref_output = strategy._fallback_python_forward(x, quantized_weight, scales, None)
+    
+    # Compute output using TileLang kernel (if K is divisible by 128)
+    if K % 128 == 0 and x.device.type == 'cuda':
+        kernel_output = strategy.linear_forward(x, weight, None, quant_kind="test")
+        
+        # Compare results
+        error = (kernel_output - ref_output).abs().max()
+        relative_error = (kernel_output - ref_output).abs() / (ref_output.abs() + 1e-8)
+        max_relative_error = relative_error.max()
+        
+        # Allow some numerical error (quantization + kernel precision)
+        assert error.item() < 1.0, f"Absolute error too large: {error.item()}"
+        assert max_relative_error.item() < 0.1, f"Relative error too large: {max_relative_error.item()}"
+    else:
+        # Should fallback to Python implementation
+        fallback_output = strategy.linear_forward(x, weight, None, quant_kind="test")
+        assert torch.allclose(fallback_output, ref_output, rtol=1e-3, atol=1e-3)
+
+
