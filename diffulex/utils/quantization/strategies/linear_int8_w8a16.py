@@ -175,25 +175,40 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
         Conditions for using TileLang kernel:
         - TileLang is available
         - Device is CUDA
-        - K dimension is divisible by block_K (128)
+        - (Kernel supports tail sizes; no K%128 constraint required)
         """
-        _ = quant_kind, kwargs
-        
-        # Lazy cache: use weight tensor id as key
-        weight_id = id(weight)
-        
-        # Check cache
-        if weight_id in self._weight_cache:
-            quantized_weight, scales = self._weight_cache[weight_id]
-            # Ensure cached tensors are on the correct device
+        _ = quant_kind
+
+        # If caller provides a pre-quantized int8 weight + scales (e.g., load-time quantized module),
+        # use them directly and DO NOT populate the lazy cache (to avoid double-storage).
+        quant_scales = kwargs.pop("quant_scales", None)
+        if weight.dtype == torch.int8:
+            if quant_scales is None:
+                raise ValueError("weight is int8 but quant_scales is None; expected per-channel scales tensor")
+            quantized_weight = weight
+            scales = quant_scales
+            if scales.dtype != torch.bfloat16:
+                scales = scales.to(dtype=torch.bfloat16)
             if quantized_weight.device != x.device:
                 quantized_weight = quantized_weight.to(device=x.device)
+            if scales.device != x.device:
                 scales = scales.to(device=x.device)
         else:
-            # Quantize weight and cache it
-            quantized_weight, scales = self.quantize_weight_for_kernel(weight, device=x.device)
-            # Cache the quantized weight and scales
-            self._weight_cache[weight_id] = (quantized_weight, scales)
+            # Lazy cache: use weight tensor id as key (only for bf16/fp16 weights)
+            weight_id = id(weight)
+
+            # Check cache
+            if weight_id in self._weight_cache:
+                quantized_weight, scales = self._weight_cache[weight_id]
+                # Ensure cached tensors are on the correct device
+                if quantized_weight.device != x.device:
+                    quantized_weight = quantized_weight.to(device=x.device)
+                    scales = scales.to(device=x.device)
+            else:
+                # Quantize weight and cache it
+                quantized_weight, scales = self.quantize_weight_for_kernel(weight, device=x.device)
+                # Cache the quantized weight and scales
+                self._weight_cache[weight_id] = (quantized_weight, scales)
         
         # Try to use TileLang kernel if available
         if _TILELANG_AVAILABLE and w8a16_gemm is not None:
@@ -206,7 +221,6 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                 # sm_89 (Hopper) requires CUDA 11.8+, sm_90+ requires CUDA 12.0+
                 # If CUDA toolkit doesn't support the GPU architecture, skip kernel attempt
                 try:
-                    import torch
                     if torch.cuda.is_available():
                         props = torch.cuda.get_device_properties(x.device.index or 0)
                         compute_cap = (props.major, props.minor)
@@ -223,17 +237,35 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                 N, K_w = quantized_weight.shape
                 assert K == K_w, f"K dimension mismatch: {K} != {K_w}"
                 
-                # Check shape constraints (K must be divisible by block_K=128)
-                block_K = 128
-                if K % block_K != 0:
-                    return self._fallback_python_forward(x, quantized_weight, scales, bias)
-                
-                # Compile kernel (will be cached by TileLang)
-                kernel = w8a16_gemm(M, N, K)
+                # Reduce JIT compilation churn:
+                # TileLang specializes kernels by (M, N, K). In generation, prefill M=batch*seqlen can vary
+                # across prompts/steps, causing extra kernel compilations mid-generation (hurts decode throughput).
+                # We bucket prefill M to a small set of values and pad activations, so kernels are reused.
+                M_bucket = M
+                if M != 1:
+                    if M <= 64:
+                        M_bucket = 64
+                    elif M <= 128:
+                        M_bucket = 128
+                    elif M <= 256:
+                        M_bucket = 256
+                    else:
+                        # Round up to a multiple of 64.
+                        M_bucket = ((M + 63) // 64) * 64
+
+                x_for_kernel = x
+                if M_bucket != M:
+                    x_pad = torch.zeros((M_bucket, K), device=x.device, dtype=x.dtype)
+                    x_pad[:M, :] = x
+                    x_for_kernel = x_pad
+
+                # Compile kernel (cached by TileLang) for the bucketed M.
+                kernel = w8a16_gemm(M_bucket, N, K, block_M=64, block_N=64, block_K=128, num_stages=2, threads=128)
                 
                 # Call kernel - out_idx=[3] means output is the 4th parameter,
                 # so we only pass inputs (x, quantized_weight, scales), and kernel returns output
-                output = kernel(x, quantized_weight, scales)
+                output_full = kernel(x_for_kernel, quantized_weight, scales)
+                output = output_full[:M, :] if M_bucket != M else output_full
                 
                 # Add bias if present
                 if bias is not None:

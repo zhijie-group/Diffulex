@@ -199,21 +199,107 @@ def test_w8a16_tilelang_kernel_correctness():
     # Compute reference output (Python implementation)
     ref_output = strategy._fallback_python_forward(x, quantized_weight, scales, None)
     
-    # Compute output using TileLang kernel (if K is divisible by 128)
-    if K % 128 == 0 and x.device.type == 'cuda':
-        kernel_output = strategy.linear_forward(x, weight, None, quant_kind="test")
-        
-        # Compare results
-        error = (kernel_output - ref_output).abs().max()
-        relative_error = (kernel_output - ref_output).abs() / (ref_output.abs() + 1e-8)
-        max_relative_error = relative_error.max()
-        
-        # Allow some numerical error (quantization + kernel precision)
-        assert error.item() < 1.0, f"Absolute error too large: {error.item()}"
-        assert max_relative_error.item() < 0.1, f"Relative error too large: {max_relative_error.item()}"
-    else:
-        # Should fallback to Python implementation
-        fallback_output = strategy.linear_forward(x, weight, None, quant_kind="test")
-        assert torch.allclose(fallback_output, ref_output, rtol=1e-3, atol=1e-3)
+    # Compute output using strategy (kernel when available; may fall back if kernel unavailable).
+    out = strategy.linear_forward(x, weight, None, quant_kind="test")
+    
+    # Compare results
+    error = (out - ref_output).abs().max()
+    relative_error = (out - ref_output).abs() / (ref_output.abs() + 1e-8)
+    max_relative_error = relative_error.max()
+    
+    # Allow some numerical error (quantization + kernel precision)
+    assert error.item() < 1.0, f"Absolute error too large: {error.item()}"
+    assert max_relative_error.item() < 0.1, f"Relative error too large: {max_relative_error.item()}"
+
+
+def test_w8a16_tilelang_kernel_tail_sizes_correctness():
+    """Tail sizes (non-multiple M/N/K) should be handled without needing K%128==0."""
+    from diffulex.utils.quantization.registry import create_linear_strategy
+    import torch
+
+    # Skip test if TileLang kernel is not available
+    try:
+        from diffulex_kernel.python.linear_kernels import w8a16_gemm  # noqa: F401
+        tilelang_available = True
+    except ImportError:
+        tilelang_available = False
+        import pytest
+        pytest.skip("TileLang kernel not available")
+    
+    if not tilelang_available:
+        return
+
+    strategy = create_linear_strategy(weight_dtype="int8", act_dtype="bf16")
+
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("CUDA not available")
+
+    # Intentionally choose tail sizes (not multiples of block_M/N=64 and block_K=128).
+    M, N, K = 127, 255, 130
+    x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+
+    # Strategy output (kernel when available; may fall back if kernel unavailable).
+    out = strategy.linear_forward(x, weight, None, quant_kind="test")
+
+    # Reference (same as fallback implementation)
+    qweight, scales = strategy.quantize_weight_for_kernel(weight, device=x.device)
+    ref = strategy._fallback_python_forward(x, qweight, scales, None)
+
+    assert out.shape == ref.shape
+    assert torch.allclose(out, ref, rtol=7e-2, atol=7e-2)
+
+
+def test_w8a16_load_time_quantized_linear_saves_weight_memory(monkeypatch):
+    """Ensure load-time quantized Linear does not keep bf16 weight Parameter on CUDA."""
+    import torch
+    import torch.distributed as dist
+
+    if not torch.cuda.is_available():
+        import pytest
+        pytest.skip("CUDA not available")
+
+    # Avoid requiring torch.distributed process group init in unit tests.
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 1)
+
+    from diffulex.layer.linear import ReplicatedLinear
+    from diffulex.utils.quantization.registry import create_linear_strategy
+    from diffulex.utils.quantization.context import get_quantization_context
+
+    ctx = get_quantization_context()
+    strategy = create_linear_strategy(weight_dtype="int8", act_dtype="bf16")
+    ctx.set_linear_strategy("attn", strategy)
+
+    lin = ReplicatedLinear(4096, 11008, bias=False, quant_kind="attn").cuda().to(dtype=torch.bfloat16)
+
+    # Simulate checkpoint load: call weight_loader on the original Parameter.
+    param = lin._parameters["weight"]
+    loaded_weight = torch.randn_like(param, device=param.device, dtype=torch.bfloat16)
+    lin.weight_loader(param, loaded_weight)
+
+    # Weight Parameter should be dropped and replaced by quant buffers.
+    assert lin.has_quantized_weight()
+    assert lin.weight is None
+    assert "weight" not in dict(lin.named_parameters())
+    assert lin.quant_weight_int8.dtype == torch.int8
+    assert lin.quant_scales.dtype == torch.bfloat16
+    assert lin.quant_weight_int8.device.type == "cuda"
+    assert lin.quant_scales.device.type == "cuda"
+
+    # Quant buffers should be significantly smaller than bf16 weight.
+    bf16_bytes = loaded_weight.numel() * loaded_weight.element_size()
+    q_bytes = lin.quant_weight_int8.numel() * lin.quant_weight_int8.element_size()
+    s_bytes = lin.quant_scales.numel() * lin.quant_scales.element_size()
+    assert (q_bytes + s_bytes) < bf16_bytes * 0.7  # conservative threshold
+
+    # Forward should run and NOT populate the lazy cache (to avoid double-storage).
+    x = torch.randn(8, 4096, device="cuda", dtype=torch.bfloat16)
+    before_cache = len(strategy._weight_cache)
+    y = lin(x)
+    after_cache = len(strategy._weight_cache)
+    assert y.shape == (8, 11008)
+    assert after_cache == before_cache
 
 

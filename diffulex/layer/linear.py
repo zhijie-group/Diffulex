@@ -44,9 +44,15 @@ class LoRAMixin:
     
     def merge_lora(self):
         """Merge LoRA weights into base weight."""
-        if hasattr(self, 'r') and self.r > 0 and not self.merged:
-            self.weight.data += self.scaling * torch.mm(self.lora_B, self.lora_A)
-            self.merged = True
+        if not (hasattr(self, 'r') and self.r > 0 and not self.merged):
+            return
+        # If base weight is missing (e.g., quantized linear removed bf16 weight Parameter),
+        # we cannot merge in-place. Keep LoRA unmerged and apply via lora_forward.
+        weight = getattr(self, "weight", None)
+        if weight is None or not hasattr(weight, "data"):
+            return
+        self.weight.data += self.scaling * torch.mm(self.lora_B, self.lora_A)
+        self.merged = True
     
     def lora_forward(self, x: torch.Tensor, base_output: torch.Tensor) -> torch.Tensor:
         """Apply LoRA forward pass."""
@@ -74,6 +80,68 @@ class LinearBase(nn.Module):
         self.quant_kind = (quant_kind or "other").strip().lower() or "other"
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
+        # Quantized weight storage (W8A16 etc.). Empty by default.
+        # NOTE: We keep these as buffers so they move with the module and do not appear as Parameters.
+        self.register_buffer("quant_weight_int8", torch.empty(0, dtype=torch.int8), persistent=False)
+        self.register_buffer("quant_scales", torch.empty(0, dtype=torch.bfloat16), persistent=False)
+        self.register_buffer("_weight_is_quantized", torch.tensor(False, dtype=torch.bool), persistent=False)
+
+    def has_quantized_weight(self) -> bool:
+        return bool(self._weight_is_quantized.item()) and self.quant_weight_int8.numel() > 0 and self.quant_scales.numel() > 0
+
+    def set_quantized_weight(self, quant_weight_int8: torch.Tensor, quant_scales: torch.Tensor) -> None:
+        if quant_weight_int8.dtype != torch.int8:
+            raise TypeError(f"quant_weight_int8 must be int8, got {quant_weight_int8.dtype}")
+        # Store scales in bf16 by default (good balance for memory/accuracy).
+        if quant_scales.dtype != torch.bfloat16:
+            quant_scales = quant_scales.to(dtype=torch.bfloat16)
+        self.quant_weight_int8 = quant_weight_int8
+        self.quant_scales = quant_scales
+        self._weight_is_quantized.fill_(True)
+
+    def _maybe_quantize_loaded_weight_param(
+        self,
+        param: nn.Parameter,
+        *,
+        loaded_shard_id: object = None,
+        expected_shard_ids: set[object] | None = None,
+    ) -> None:
+        """If current Linear is configured for W8A16, quantize the loaded bf16 weight and drop the bf16 Parameter.
+
+        This is called at the end of weight_loader(), after the shard copy is done.
+        """
+        # Only process the real weight Parameter (ignore bias).
+        current_weight = self._parameters.get("weight", None)
+        if current_weight is None or current_weight is not param:
+            return
+
+        # Some modules load the same weight parameter in multiple shards (e.g., QKV / merged linears).
+        # In that case, we must wait until all shards are loaded before quantizing/removing the bf16 Parameter,
+        # otherwise subsequent shard loads would fail (model.get_parameter can't find it).
+        if expected_shard_ids is not None:
+            if not hasattr(self, "_loaded_weight_shard_ids"):
+                self._loaded_weight_shard_ids: set[object] = set()
+            self._loaded_weight_shard_ids.add(loaded_shard_id)
+            if self._loaded_weight_shard_ids != expected_shard_ids:
+                return
+
+        # Get strategy for this kind; default bf16 strategy should not trigger quantization.
+        strategy = get_linear_strategy(self.quant_kind)
+        if strategy is None:
+            return
+        if getattr(strategy, "linear_weight_format", None) != "int8":
+            return
+        if getattr(strategy, "linear_act_format", None) != "bf16":
+            return
+
+        # Quantize on the same device as the loaded param (typically CUDA).
+        qweight, scales = strategy.quantize_weight_for_kernel(param.data, device=param.data.device)
+        self.set_quantized_weight(qweight, scales)
+
+        # Drop bf16 weight Parameter to free GPU memory.
+        self._parameters.pop("weight", None)
+        # Keep attribute for compatibility, but ensure forward uses quant buffers.
+        setattr(self, "weight", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -104,10 +172,21 @@ class ReplicatedLinear(LinearBase, LoRAMixin):
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight)
+        self._maybe_quantize_loaded_weight_param(param, loaded_shard_id=None, expected_shard_ids={None})
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         strategy = get_linear_strategy(self.quant_kind)
-        if strategy is None:
+        if self.has_quantized_weight():
+            if strategy is None:
+                raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
+            base_out = strategy.linear_forward(
+                x,
+                self.quant_weight_int8,
+                self.bias,
+                quant_kind=self.quant_kind,
+                quant_scales=self.quant_scales,
+            )
+        elif strategy is None:
             base_out = F.linear(x, self.weight, self.bias)
         else:
             base_out = strategy.linear_forward(x, self.weight, self.bias, quant_kind=self.quant_kind)
@@ -146,10 +225,21 @@ class ColumnParallelLinear(LinearBase, LoRAMixin):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
+        self._maybe_quantize_loaded_weight_param(param, loaded_shard_id=None, expected_shard_ids={None})
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         strategy = get_linear_strategy(self.quant_kind)
-        if strategy is None:
+        if self.has_quantized_weight():
+            if strategy is None:
+                raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
+            base_out = strategy.linear_forward(
+                x,
+                self.quant_weight_int8,
+                self.bias,
+                quant_kind=self.quant_kind,
+                quant_scales=self.quant_scales,
+            )
+        elif strategy is None:
             base_out = F.linear(x, self.weight, self.bias)
         else:
             base_out = strategy.linear_forward(x, self.weight, self.bias, quant_kind=self.quant_kind)
@@ -186,6 +276,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
+        expected = set(range(len(self.output_sizes)))
+        self._maybe_quantize_loaded_weight_param(param, loaded_shard_id=loaded_shard_id, expected_shard_ids=expected)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -227,6 +319,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
+        self._maybe_quantize_loaded_weight_param(param, loaded_shard_id=loaded_shard_id, expected_shard_ids={"q", "k", "v"})
 
 
 class RowParallelLinear(LinearBase, LoRAMixin):
@@ -261,11 +354,22 @@ class RowParallelLinear(LinearBase, LoRAMixin):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
+        self._maybe_quantize_loaded_weight_param(param, loaded_shard_id=None, expected_shard_ids={None})
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bias = self.bias if self.tp_rank == 0 else None
         strategy = get_linear_strategy(self.quant_kind)
-        if strategy is None:
+        if self.has_quantized_weight():
+            if strategy is None:
+                raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
+            y = strategy.linear_forward(
+                x,
+                self.quant_weight_int8,
+                bias,
+                quant_kind=self.quant_kind,
+                quant_scales=self.quant_scales,
+            )
+        elif strategy is None:
             y = F.linear(x, self.weight, bias)
         else:
             y = strategy.linear_forward(x, self.weight, bias, quant_kind=self.quant_kind)
