@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""测试 W8A16 Linear 量化策略的文本生成"""
+"""测试 W4A16 Linear 量化策略的文本生成"""
 import os
 import sys
 import time
 from pathlib import Path
-import gc
 
 # 确保从当前仓库导入
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -96,27 +95,6 @@ def test_generation(llm, tokenizer, test_name: str, prompts: list[str], warmup: 
         return None
 
 
-def _cleanup_llm(llm):
-    """Best-effort cleanup to release GPU memory and NCCL resources even on exceptions."""
-    try:
-        if llm is not None:
-            llm.exit()
-    except Exception:
-        pass
-    try:
-        import torch
-        import torch.distributed as dist
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
-    try:
-        gc.collect()
-    except Exception:
-        pass
-
-
 def main():
     # 检查模型路径
     model_path = os.getenv("DIFFULEX_TEST_MODEL", "/data1/ckpts/Dream-org/Dream-v0-Base-7B")
@@ -126,7 +104,7 @@ def main():
         return
     
     print("=" * 70)
-    print("Diffulex W8A16 Linear 量化文本生成测试")
+    print("Diffulex W4A16 Linear 量化文本生成测试")
     print("=" * 70)
     print(f"模型路径: {model_path}")
     
@@ -147,14 +125,13 @@ def main():
     # 存储性能结果用于对比
     results = {}
     
-    # 测试 1: W8A16 Linear + BF16 KV
+    # 测试 1: W4A16 Linear + BF16 KV
     print("\n" + "=" * 70)
-    print("测试 1: W8A16 Linear + BF16 KV Cache")
+    print("测试 1: W4A16 Linear + BF16 KV Cache")
     print("=" * 70)
     
-    llm_w8a16_bf16kv = None
     try:
-        llm_w8a16_bf16kv = Diffulex(
+        llm_w4a16_bf16kv = Diffulex(
             model_path,
             lora_path=os.getenv("DIFFULEX_TEST_LORA", ""),
             use_lora=bool(os.getenv("DIFFULEX_TEST_LORA", "")),
@@ -169,37 +146,43 @@ def main():
             kv_cache_dtype="bf16",
             kv_cache_layout="unified",
             decoding_strategy="d2f",
-            # W8A16 配置
-            linear_attn_weight_dtype="int8",
-            linear_mlp_weight_dtype="int8",
+            # W4A16 配置
+            linear_attn_weight_dtype="int4",
+            linear_mlp_weight_dtype="int4",
             linear_attn_act_dtype="bf16",
             linear_mlp_act_dtype="bf16",
         )
-        print("✓ W8A16 + BF16 KV 模型初始化成功")
+        print("✓ W4A16 + BF16 KV 模型初始化成功")
         
         # 第一轮：Warmup（排除 kernel 编译影响）
-        test_generation(llm_w8a16_bf16kv, tokenizer, "W8A16 Linear + BF16 KV", test_prompts, warmup=True)
+        test_generation(llm_w4a16_bf16kv, tokenizer, "W4A16 Linear + BF16 KV", test_prompts, warmup=True)
         
         # 第二轮：实际测试（kernel 已编译，看稳态性能）
-        result = test_generation(llm_w8a16_bf16kv, tokenizer, "W8A16 Linear + BF16 KV", test_prompts, warmup=False)
+        result = test_generation(llm_w4a16_bf16kv, tokenizer, "W4A16 Linear + BF16 KV", test_prompts, warmup=False)
         if result:
-            results['W8A16+BF16KV'] = result
+            results['W4A16+BF16KV'] = result
+        
+        # 清理
+        llm_w4a16_bf16kv.exit()
+        del llm_w4a16_bf16kv
+        import torch
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        torch.cuda.empty_cache()
+        
     except Exception as e:
-        print(f"✗ W8A16 + BF16 KV 路径测试失败: {e}")
+        print(f"✗ W4A16 + BF16 KV 路径测试失败: {e}")
         import traceback
         traceback.print_exc()
-    finally:
-        _cleanup_llm(llm_w8a16_bf16kv)
-        llm_w8a16_bf16kv = None
     
-    # 测试 2: W8A16 Linear + FP8 KV
+    # 测试 2: W4A16 Linear + FP8 KV
     print("\n" + "=" * 70)
-    print("测试 2: W8A16 Linear + FP8 KV Cache")
+    print("测试 2: W4A16 Linear + FP8 KV Cache")
     print("=" * 70)
     
-    llm_w8a16_fp8kv = None
     try:
-        llm_w8a16_fp8kv = Diffulex(
+        llm_w4a16_fp8kv = Diffulex(
             model_path,
             lora_path=os.getenv("DIFFULEX_TEST_LORA", ""),
             use_lora=bool(os.getenv("DIFFULEX_TEST_LORA", "")),
@@ -214,28 +197,35 @@ def main():
             kv_cache_dtype="fp8",  # FP8 KV cache
             kv_cache_layout="unified",  # FP8 kernel 只支持 unified layout
             decoding_strategy="d2f",
-            # W8A16 配置
-            linear_attn_weight_dtype="int8",
-            linear_mlp_weight_dtype="int8",
+            # W4A16 配置
+            linear_attn_weight_dtype="int4",
+            linear_mlp_weight_dtype="int4",
             linear_attn_act_dtype="bf16",
             linear_mlp_act_dtype="bf16",
         )
-        print("✓ W8A16 + FP8 KV 模型初始化成功")
+        print("✓ W4A16 + FP8 KV 模型初始化成功")
         
         # 第一轮：Warmup（排除 kernel 编译影响）
-        test_generation(llm_w8a16_fp8kv, tokenizer, "W8A16 Linear + FP8 KV", test_prompts, warmup=True)
+        test_generation(llm_w4a16_fp8kv, tokenizer, "W4A16 Linear + FP8 KV", test_prompts, warmup=True)
         
         # 第二轮：实际测试（kernel 已编译，看稳态性能）
-        result = test_generation(llm_w8a16_fp8kv, tokenizer, "W8A16 Linear + FP8 KV", test_prompts, warmup=False)
+        result = test_generation(llm_w4a16_fp8kv, tokenizer, "W4A16 Linear + FP8 KV", test_prompts, warmup=False)
         if result:
-            results['W8A16+FP8KV'] = result
+            results['W4A16+FP8KV'] = result
+        
+        # 清理
+        llm_w4a16_fp8kv.exit()
+        del llm_w4a16_fp8kv
+        import torch
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        torch.cuda.empty_cache()
+        
     except Exception as e:
-        print(f"✗ W8A16 + FP8 KV 路径测试失败: {e}")
+        print(f"✗ W4A16 + FP8 KV 路径测试失败: {e}")
         import traceback
         traceback.print_exc()
-    finally:
-        _cleanup_llm(llm_w8a16_fp8kv)
-        llm_w8a16_fp8kv = None
     
     # 性能对比
     if len(results) == 2:
@@ -248,8 +238,8 @@ def main():
             print(f"{name:<20} {result['total_time']:<15.2f} {result['total_tokens']:<15} {result['avg_tps']:<20.2f}")
         
         # 计算性能差异
-        bf16kv_result = results.get('W8A16+BF16KV')
-        fp8kv_result = results.get('W8A16+FP8KV')
+        bf16kv_result = results.get('W4A16+BF16KV')
+        fp8kv_result = results.get('W4A16+FP8KV')
         if bf16kv_result and fp8kv_result:
             tps_diff = ((fp8kv_result['avg_tps'] - bf16kv_result['avg_tps']) / bf16kv_result['avg_tps']) * 100
             time_diff = ((fp8kv_result['total_time'] - bf16kv_result['total_time']) / bf16kv_result['total_time']) * 100

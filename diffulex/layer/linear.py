@@ -106,9 +106,10 @@ class LinearBase(nn.Module):
         loaded_shard_id: object = None,
         expected_shard_ids: set[object] | None = None,
     ) -> None:
-        """If current Linear is configured for W8A16, quantize the loaded bf16 weight and drop the bf16 Parameter.
+        """If current Linear is configured for W8A16/W4A16, quantize the loaded bf16 weight and drop the bf16 Parameter.
 
         This is called at the end of weight_loader(), after the shard copy is done.
+        Supports both int8 (W8A16) and int4 (W4A16) quantization.
         """
         # Only process the real weight Parameter (ignore bias).
         current_weight = self._parameters.get("weight", None)
@@ -129,9 +130,13 @@ class LinearBase(nn.Module):
         strategy = get_linear_strategy(self.quant_kind)
         if strategy is None:
             return
-        if getattr(strategy, "linear_weight_format", None) != "int8":
+        weight_format = getattr(strategy, "linear_weight_format", None)
+        act_format = getattr(strategy, "linear_act_format", None)
+        
+        # Support both int8 (W8A16) and int4 (W4A16) quantization
+        if weight_format not in ("int8", "int4"):
             return
-        if getattr(strategy, "linear_act_format", None) != "bf16":
+        if act_format != "bf16":
             return
 
         # Quantize on the same device as the loaded param (typically CUDA).
@@ -179,12 +184,19 @@ class ReplicatedLinear(LinearBase, LoRAMixin):
         if self.has_quantized_weight():
             if strategy is None:
                 raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
+            # For int4 (W4A16), we need to pass original_in_features
+            weight_format = getattr(strategy, "linear_weight_format", None)
+            kwargs = {"quant_scales": self.quant_scales}
+            if weight_format == "int4":
+                # For int4, packed weight shape is [out_features, (in_features + 1) // 2]
+                # We use x.shape[1] as the source of truth (it's the actual K dimension)
+                kwargs["original_in_features"] = x.shape[1]
             base_out = strategy.linear_forward(
                 x,
                 self.quant_weight_int8,
                 self.bias,
                 quant_kind=self.quant_kind,
-                quant_scales=self.quant_scales,
+                **kwargs,
             )
         elif strategy is None:
             base_out = F.linear(x, self.weight, self.bias)
@@ -232,12 +244,19 @@ class ColumnParallelLinear(LinearBase, LoRAMixin):
         if self.has_quantized_weight():
             if strategy is None:
                 raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
+            # For int4 (W4A16), we need to pass original_in_features
+            weight_format = getattr(strategy, "linear_weight_format", None)
+            kwargs = {"quant_scales": self.quant_scales}
+            if weight_format == "int4":
+                # For int4, packed weight shape is [out_features, (in_features + 1) // 2]
+                # We use x.shape[1] as the source of truth (it's the actual K dimension)
+                kwargs["original_in_features"] = x.shape[1]
             base_out = strategy.linear_forward(
                 x,
                 self.quant_weight_int8,
                 self.bias,
                 quant_kind=self.quant_kind,
-                quant_scales=self.quant_scales,
+                **kwargs,
             )
         elif strategy is None:
             base_out = F.linear(x, self.weight, self.bias)
