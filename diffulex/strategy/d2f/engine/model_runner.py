@@ -241,6 +241,20 @@ class D2FModelRunner(ModelRunnerBase):
         slot_mapping_tensor = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
+        # NOTE:
+        # - d2f decode currently uses "varlen" mode by default.
+        # - When kv_cache_dtype is FP8, "varlen" decode falls back to Python dequantization via
+        #   `load_kvcache`, which can materialize large intermediate tensors and often makes FP8
+        #   KV *slower* than BF16.
+        # - Prefer TileLang's BF16Q+FP8KV decode kernel path by switching to "static" mode when
+        #   FP8 KV is enabled.
+        decode_mode = "varlen"
+        try:
+            from diffulex.utils.kv_cache_dtype import parse_kv_cache_dtype
+            if parse_kv_cache_dtype(getattr(self.config, "kv_cache_dtype", "bf16")).is_fp8:
+                decode_mode = "static"
+        except Exception:
+            decode_mode = "varlen"
         set_d2f_attn_metadata(
             False,
             slot_mapping=slot_mapping_tensor,
@@ -256,7 +270,7 @@ class D2FModelRunner(ModelRunnerBase):
             kv_cache_layout=self.config.kv_cache_layout,
             need_kv_cache_store=need_kv_cache_store,
             diffusion_block_size=self.diffusion_block_size,
-            decode_mode="varlen",
+            decode_mode=decode_mode,
             attn_type="full_attention",
         )
         return input_ids_tensor, positions_tensor

@@ -92,9 +92,20 @@ class LinearBase(nn.Module):
     def set_quantized_weight(self, quant_weight_int8: torch.Tensor, quant_scales: torch.Tensor) -> None:
         if quant_weight_int8.dtype != torch.int8:
             raise TypeError(f"quant_weight_int8 must be int8, got {quant_weight_int8.dtype}")
-        # Store scales in bf16 by default (good balance for memory/accuracy).
-        if quant_scales.dtype != torch.bfloat16:
-            quant_scales = quant_scales.to(dtype=torch.bfloat16)
+        # Store scales dtype depends on strategy:
+        # - W8A16/W4A16 kernels currently take bf16 scales.
+        # - W8A8/W4A8 paths are more sensitive to scale precision; keep scales at fp16.
+        try:
+            strategy = get_linear_strategy(self.quant_kind)
+        except Exception:
+            strategy = None
+        scale_dtype = torch.bfloat16
+        if strategy is not None:
+            act_format = getattr(strategy, "linear_act_format", None)
+            if act_format == "int8":
+                scale_dtype = torch.float16
+        if quant_scales.dtype != scale_dtype:
+            quant_scales = quant_scales.to(dtype=scale_dtype)
         self.quant_weight_int8 = quant_weight_int8
         self.quant_scales = quant_scales
         self._weight_is_quantized.fill_(True)
@@ -131,12 +142,15 @@ class LinearBase(nn.Module):
         if strategy is None:
             return
         weight_format = getattr(strategy, "linear_weight_format", None)
-        act_format = getattr(strategy, "linear_act_format", None)
-        
-        # Support both int8 (W8A16) and int4 (W4A16) quantization
-        if weight_format not in ("int8", "int4"):
+        # NOTE: We intentionally do NOT require act_format == "bf16" here.
+        # For W8A8/W4A8 we still want to quantize+drop the bf16 weight Parameter at load-time.
+        # But we must avoid doing this for the generic stub strategy (unsupported combos),
+        # otherwise we'd drop weights and then raise NotImplementedError at runtime.
+        if getattr(strategy, "name", "").startswith("linear_stub"):
             return
-        if act_format != "bf16":
+        
+        # Support int8/int4 weight formats (W8A16/W8A8 and W4A16/W4A8).
+        if weight_format not in ("int8", "int4"):
             return
 
         # Quantize on the same device as the loaded param (typically CUDA).
@@ -201,7 +215,12 @@ class ReplicatedLinear(LinearBase, LoRAMixin):
         elif strategy is None:
             base_out = F.linear(x, self.weight, self.bias)
         else:
-            base_out = strategy.linear_forward(x, self.weight, self.bias, quant_kind=self.quant_kind)
+            # For int4 strategies (W4A16/W4A8), we need to pass original_in_features even when weight is not quantized yet
+            weight_format = getattr(strategy, "linear_weight_format", None)
+            kwargs = {}
+            if weight_format == "int4":
+                kwargs["original_in_features"] = x.shape[1]
+            base_out = strategy.linear_forward(x, self.weight, self.bias, quant_kind=self.quant_kind, **kwargs)
         return self.lora_forward(x, base_out)
 
 
@@ -261,7 +280,12 @@ class ColumnParallelLinear(LinearBase, LoRAMixin):
         elif strategy is None:
             base_out = F.linear(x, self.weight, self.bias)
         else:
-            base_out = strategy.linear_forward(x, self.weight, self.bias, quant_kind=self.quant_kind)
+            # For int4 strategies (W4A16/W4A8), we need to pass original_in_features even when weight is not quantized yet
+            weight_format = getattr(strategy, "linear_weight_format", None)
+            kwargs = {}
+            if weight_format == "int4":
+                kwargs["original_in_features"] = x.shape[1]
+            base_out = strategy.linear_forward(x, self.weight, self.bias, quant_kind=self.quant_kind, **kwargs)
         return self.lora_forward(x, base_out)
 
 
@@ -381,17 +405,28 @@ class RowParallelLinear(LinearBase, LoRAMixin):
         if self.has_quantized_weight():
             if strategy is None:
                 raise RuntimeError("Quantized weight is present but no linear strategy is configured.")
+            # For int4 (W4A16), we must pass original_in_features to disambiguate packed K.
+            weight_format = getattr(strategy, "linear_weight_format", None)
+            kwargs = {"quant_scales": self.quant_scales}
+            if weight_format == "int4":
+                # Use activation K as the source of truth (it's the actual K dimension).
+                kwargs["original_in_features"] = x.shape[1]
             y = strategy.linear_forward(
                 x,
                 self.quant_weight_int8,
                 bias,
                 quant_kind=self.quant_kind,
-                quant_scales=self.quant_scales,
+                **kwargs,
             )
         elif strategy is None:
             y = F.linear(x, self.weight, bias)
         else:
-            y = strategy.linear_forward(x, self.weight, bias, quant_kind=self.quant_kind)
+            # For int4 strategies (W4A16/W4A8), we need to pass original_in_features even when weight is not quantized yet
+            weight_format = getattr(strategy, "linear_weight_format", None)
+            kwargs = {}
+            if weight_format == "int4":
+                kwargs["original_in_features"] = x.shape[1]
+            y = strategy.linear_forward(x, self.weight, bias, quant_kind=self.quant_kind, **kwargs)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return self.lora_forward(x, y)

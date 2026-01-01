@@ -29,6 +29,26 @@ def test_linear_strategy_registry_int4_w4a16():
     assert s.linear_act_format == "bf16"
 
 
+def test_linear_strategy_registry_int8_w8a8():
+    """Test that int8+int8 returns the real W8A8 strategy (not stub)."""
+    from diffulex.utils.quantization.registry import create_linear_strategy
+
+    s = create_linear_strategy(weight_dtype="int8", act_dtype="int8")
+    assert s.name == "linear_int8_w8a8"
+    assert s.linear_weight_format == "int8"
+    assert s.linear_act_format == "int8"
+
+
+def test_linear_strategy_registry_int4_w4a8():
+    """Test that int4+int8 returns the real W4A8 strategy (not stub)."""
+    from diffulex.utils.quantization.registry import create_linear_strategy
+
+    s = create_linear_strategy(weight_dtype="int4", act_dtype="int8")
+    assert s.name == "linear_int4_w4a8"
+    assert s.linear_weight_format == "int4"
+    assert s.linear_act_format == "int8"
+
+
 def test_linear_strategy_registry_non_bf16_returns_stub():
     """Test that unimplemented combinations (e.g., fp8) return stub."""
     from diffulex.utils.quantization.registry import create_linear_strategy

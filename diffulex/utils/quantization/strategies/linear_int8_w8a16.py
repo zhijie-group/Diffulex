@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -48,6 +49,8 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
         # Cache: weight_id -> (quantized_weight, scales)
         # Using id(weight) as key since the same Parameter object is reused across forwards
         self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Optional cache: weight_id -> bf16 dequantized weight (speed-first; uses extra memory)
+        self._dequant_weight_cache: dict[int, torch.Tensor] = {}
 
     @property
     def name(self) -> str:
@@ -210,6 +213,23 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                 # Cache the quantized weight and scales
                 self._weight_cache[weight_id] = (quantized_weight, scales)
         
+        # Speed-first option:
+        # Using the TileLang kernel can be slower than cuBLAS BF16 GEMM for small/typical decode shapes.
+        # If enabled, we dequantize once and reuse a cached bf16 weight for F.linear (cuBLAS).
+        # This trades extra GPU memory for throughput.
+        if os.getenv("DIFFULEX_W8A16_PREFER_CUBLAS", "0") == "1":
+            # Key by the actual weight object we received (bf16 Parameter or int8 buffer).
+            deq_key = id(weight)
+            deq_w = self._dequant_weight_cache.get(deq_key)
+            if deq_w is None or deq_w.device != x.device:
+                # Dequantize: int8[N,K] * scales[N] -> bf16[N,K]
+                s = scales
+                if s.dim() == 1:
+                    s = s.unsqueeze(-1)
+                deq_w = (quantized_weight.to(torch.float32) * s.to(torch.float32)).to(torch.bfloat16)
+                self._dequant_weight_cache[deq_key] = deq_w
+            return F.linear(x, deq_w, bias)
+        
         # Try to use TileLang kernel if available
         if _TILELANG_AVAILABLE and w8a16_gemm is not None:
             try:
@@ -237,20 +257,16 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                 N, K_w = quantized_weight.shape
                 assert K == K_w, f"K dimension mismatch: {K} != {K_w}"
                 
-                # Reduce JIT compilation churn:
-                # TileLang specializes kernels by (M, N, K). In generation, prefill M=batch*seqlen can vary
-                # across prompts/steps, causing extra kernel compilations mid-generation (hurts decode throughput).
-                # We bucket prefill M to a small set of values and pad activations, so kernels are reused.
+                # Reduce TileLang JIT compilation churn without killing small-M decode performance.
+                # Previous logic padded *any* M!=1 to 64/128/256, which can turn decode M=2/4 into M=64.
+                # We instead bucket to a small stable set:
+                # - for M<=64: next power-of-two (2,4,8,16,32,64)
+                # - for M>64: round up to a multiple of 64
                 M_bucket = M
-                if M != 1:
+                if M > 1:
                     if M <= 64:
-                        M_bucket = 64
-                    elif M <= 128:
-                        M_bucket = 128
-                    elif M <= 256:
-                        M_bucket = 256
+                        M_bucket = 1 << (M - 1).bit_length()
                     else:
-                        # Round up to a multiple of 64.
                         M_bucket = ((M + 63) // 64) * 64
 
                 x_for_kernel = x
@@ -260,6 +276,8 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                     x_for_kernel = x_pad
 
                 # Compile kernel (cached by TileLang) for the bucketed M.
+                # Note: keep a single tiling config to avoid exploding the number of compiled kernels
+                # (N/K vary by layer; adding more block_M variants can introduce mid-run compilations).
                 kernel = w8a16_gemm(M_bucket, N, K, block_M=64, block_N=64, block_K=128, num_stages=2, threads=128)
                 
                 # Call kernel - out_idx=[3] means output is the 4th parameter,
@@ -356,4 +374,5 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
         Useful for memory management or when weights are updated (e.g., fine-tuning).
         """
         self._weight_cache.clear()
+        self._dequant_weight_cache.clear()
 

@@ -880,36 +880,50 @@ def _dllm_flash_attn_decode_bf16_q_fp8_kv(
         )
 
         # BF16-Q/FP8-KV decode needs its own autotuned config; do not reuse prefill/BF16 config.
-        if is_warming_up() or kernel_config_bf16_q_fp8_kv_decode is None:
-            with set_autotune_inputs([
-                q, k, v,
-                k_cache, v_cache,
-                attn_metadata.k_scale,
-                attn_metadata.v_scale,
+        # In some environments, TileLang autotuning may fail (e.g. no valid configs compile/validate).
+        # In that case, fall back to the varlen path (Python dequant + flash-attn varlen) for correctness.
+        try:
+            if is_warming_up() or kernel_config_bf16_q_fp8_kv_decode is None:
+                with set_autotune_inputs([
+                    q, k, v,
+                    k_cache, v_cache,
+                    attn_metadata.k_scale,
+                    attn_metadata.v_scale,
+                    attn_metadata.block_tables,
+                    attn_metadata.context_lens,
+                    attn_metadata.cu_seqlens_q,
+                    attn_metadata.cu_seqlens_k,
+                    attn_metadata.max_seqlen_q,
+                ]):
+                    decode_kernel = dllm_flash_attn_decode_kernel_bf16_q_fp8_kv(*common_args)
+                kernel_config_bf16_q_fp8_kv_decode = decode_kernel.config
+            else:
+                decode_kernel = dllm_flash_attn_decode_kernel_bf16_q_fp8_kv(
+                    *common_args,
+                    **kernel_config_bf16_q_fp8_kv_decode,
+                )
+
+            return decode_kernel(
+                q, k, v, k_cache, v_cache,
+                attn_metadata.k_scale,  # Pass K scale
+                attn_metadata.v_scale,  # Pass V scale
                 attn_metadata.block_tables,
                 attn_metadata.context_lens,
                 attn_metadata.cu_seqlens_q,
                 attn_metadata.cu_seqlens_k,
                 attn_metadata.max_seqlen_q,
-            ]):
-                decode_kernel = dllm_flash_attn_decode_kernel_bf16_q_fp8_kv(*common_args)
-            kernel_config_bf16_q_fp8_kv_decode = decode_kernel.config
-        else:
-            decode_kernel = dllm_flash_attn_decode_kernel_bf16_q_fp8_kv(
-                *common_args,
-                **kernel_config_bf16_q_fp8_kv_decode,
             )
-
-        return decode_kernel(
-            q, k, v, k_cache, v_cache,
-            attn_metadata.k_scale,  # Pass K scale
-            attn_metadata.v_scale,  # Pass V scale
-            attn_metadata.block_tables,
-            attn_metadata.context_lens,
-            attn_metadata.cu_seqlens_q,
-            attn_metadata.cu_seqlens_k,
-            attn_metadata.max_seqlen_q,
-        )
+        except RuntimeError as e:
+            # Fall back if autotuning or runtime validation fails.
+            if "Auto-tuning failed" in str(e) or "No configuration" in str(e):
+                k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)
+                return flash_attn_varlen_func(
+                    q, k_comb, v_comb,
+                    attn_metadata.cu_seqlens_q, attn_metadata.cu_seqlens_k,
+                    attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k,
+                    softmax_scale=scale, block_table=None
+                )
+            raise
     elif attn_metadata.decode_mode == "varlen":
         # varlen模式使用load_kvcache（已在Python层处理FP8）
         k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -52,6 +53,8 @@ class LinearInt4W4A16Strategy(LinearQuantizationStrategy):
         # Cache: weight_id -> (packed_weight_int8, scales)
         # Using id(weight) as key since the same Parameter object is reused across forwards
         self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Optional cache: weight_id -> bf16 dequantized weight (speed-first; uses extra memory)
+        self._dequant_weight_cache: dict[int, torch.Tensor] = {}
 
     @property
     def name(self) -> str:
@@ -288,20 +291,30 @@ class LinearInt4W4A16Strategy(LinearQuantizationStrategy):
         if weight.dtype == torch.int8:
             if quant_scales is None:
                 raise ValueError("weight is int8 (packed int4) but quant_scales is None; expected per-channel scales tensor")
+            # We have activation K; that's the real in_features for this matmul.
+            # Using packed_size*2 is fragile (it breaks if the int4 weights are stored "unpacked" as int8[N, K]).
+            M, K = x.shape
             if original_in_features is None:
-                # Infer from weight shape: packed_size = (in_features + 1) // 2
-                # So in_features could be packed_size * 2 or packed_size * 2 - 1
-                # We'll use packed_size * 2 (maximum), but this might be wrong if in_features was odd
-                # Caller should provide original_in_features
-                packed_size = weight.shape[1]
-                original_in_features = packed_size * 2
-                import warnings
-                warnings.warn(
-                    f"original_in_features not provided, inferring as {original_in_features} from packed shape. "
-                    "This may be incorrect if original in_features was odd. Please provide original_in_features.",
-                    UserWarning,
+                original_in_features = K
+
+            # Accept both representations:
+            # - packed int4: int8[N, (K+1)//2] where each byte holds 2 int4
+            # - unpacked int4: int8[N, K] where each element is an int4 value stored in int8
+            expected_packed_K = (K + 1) // 2
+            if weight.shape[1] == expected_packed_K:
+                packed_weight = weight
+            elif weight.shape[1] == K:
+                # Unpacked int4 -> pack on-the-fly so we can use the same kernel path.
+                # Support both [-8, 7] (signed int4) and [0, 15] (uint4 stored in int8).
+                w = weight
+                if (w.min() >= 0) and (w.max() <= 15):
+                    w = (w.to(torch.int16) - 8).to(torch.int8)
+                packed_weight = self._pack_int4_to_int8(w)
+            else:
+                raise ValueError(
+                    f"Unexpected int4 weight shape for int8 weight: got {tuple(weight.shape)}, "
+                    f"expected (N,{expected_packed_K}) for packed or (N,{K}) for unpacked."
                 )
-            packed_weight = weight
             scales = quant_scales
             if scales.dtype != torch.bfloat16:
                 scales = scales.to(dtype=torch.bfloat16)
@@ -332,6 +345,23 @@ class LinearInt4W4A16Strategy(LinearQuantizationStrategy):
                 self._weight_cache[weight_id] = (packed_weight, scales)
                 # Store original_in_features for later use
                 original_in_features = weight.shape[1]
+
+        # Speed-first option:
+        # If enabled, dequantize once and reuse a cached bf16 weight for F.linear (cuBLAS).
+        # This trades extra GPU memory for throughput.
+        if os.getenv("DIFFULEX_W4A16_PREFER_CUBLAS", "0") == "1":
+            deq_key = id(weight)
+            deq_w = self._dequant_weight_cache.get(deq_key)
+            if deq_w is None or deq_w.device != x.device:
+                deq_w = self.dequantize(
+                    packed_weight,
+                    scales,
+                    original_in_features=original_in_features,
+                )
+                if deq_w.device != x.device:
+                    deq_w = deq_w.to(device=x.device)
+                self._dequant_weight_cache[deq_key] = deq_w
+            return F.linear(x, deq_w, bias)
         
         # Try to use TileLang kernel if available
         if _TILELANG_AVAILABLE and w4a16_gemm is not None:
@@ -358,17 +388,16 @@ class LinearInt4W4A16Strategy(LinearQuantizationStrategy):
                 expected_packed_K = (original_in_features + 1) // 2
                 assert packed_K == expected_packed_K, f"Packed K dimension mismatch: {packed_K} != {expected_packed_K}"
                 
-                # Reduce JIT compilation churn: M-bucketing for prefill
+                # Reduce TileLang JIT compilation churn without killing small-M decode performance.
+                # Previous logic padded *any* M!=1 to 64/128/256, which can turn decode M=2/4 into M=64.
+                # We instead bucket to a small stable set:
+                # - for M<=64: next power-of-two (2,4,8,16,32,64)
+                # - for M>64: round up to a multiple of 64
                 M_bucket = M
-                if M != 1:
+                if M > 1:
                     if M <= 64:
-                        M_bucket = 64
-                    elif M <= 128:
-                        M_bucket = 128
-                    elif M <= 256:
-                        M_bucket = 256
+                        M_bucket = 1 << (M - 1).bit_length()
                     else:
-                        # Round up to a multiple of 64
                         M_bucket = ((M + 63) // 64) * 64
 
                 x_for_kernel = x
@@ -377,7 +406,9 @@ class LinearInt4W4A16Strategy(LinearQuantizationStrategy):
                     x_pad[:M, :] = x
                     x_for_kernel = x_pad
 
-                # Compile kernel (cached by TileLang) for the bucketed M
+                # Compile kernel (cached by TileLang) for the bucketed M.
+                # Note: keep a single tiling config to avoid exploding the number of compiled kernels
+                # (N/K vary by layer; adding more block_M variants can introduce mid-run compilations).
                 kernel = w4a16_gemm(M_bucket, N, K, block_M=64, block_N=64, block_K=128, num_stages=2, threads=128)
                 
                 # Call kernel - out_idx=[3] means output is the 4th parameter,
@@ -457,4 +488,5 @@ class LinearInt4W4A16Strategy(LinearQuantizationStrategy):
         Useful for memory management or when weights are updated (e.g., fine-tuning).
         """
         self._weight_cache.clear()
+        self._dequant_weight_cache.clear()
 
