@@ -13,6 +13,9 @@ from multiprocessing.connection import wait as mp_wait
 from diffulex.config import Config
 from diffulex.engine.tp_worker import DiffulexTPWorker
 from diffulex.sampling_params import SamplingParams
+from diffulex.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def _dp_child_entry(config: Config, dp_idx: int, local_devices: list[int], conn):
@@ -79,7 +82,7 @@ def _dp_child_entry(config: Config, dp_idx: int, local_devices: list[int], conn)
             else:
                 conn.send(("err", f"unknown_cmd:{cmd}"))
     except Exception as e:
-        # Include full traceback for easier debugging and also print to stderr as a fallback.
+        # Include full traceback for easier debugging and also log as a fallback.
         tb = traceback.format_exc()
         msg = f"{type(e).__name__}: {e}\n{tb}"
         try:
@@ -87,9 +90,15 @@ def _dp_child_entry(config: Config, dp_idx: int, local_devices: list[int], conn)
         except Exception:
             pass
         try:
-            print(f"[DP Child {dp_idx}] Unhandled exception:\n{msg}", file=sys.stderr, flush=True)
+            # Use logger for error reporting
+            child_logger = get_logger(f"diffulex.engine.dp_worker.child_{dp_idx}")
+            child_logger.error(f"[DP Child {dp_idx}] Unhandled exception:\n{msg}")
         except Exception:
-            pass
+            # Final fallback to stderr
+            try:
+                print(f"[DP Child {dp_idx}] Unhandled exception:\n{msg}", file=sys.stderr, flush=True)
+            except Exception:
+                pass
 
 
 class DiffulexDPWorker:

@@ -5,7 +5,8 @@ Diffulex Benchmark - Benchmark framework for evaluating Diffulex inference engin
 from diffulex_bench.runner import BenchmarkRunner
 from diffulex_bench.datasets import load_benchmark_dataset
 from diffulex_bench.metrics import compute_metrics
-from diffulex_bench.logger import setup_logger, get_logger
+from diffulex.logger import setup_logger, get_logger
+from diffulex_bench.config import BenchmarkConfig, EngineConfig, EvalConfig
 
 # Import lm_eval model to register it
 try:
@@ -16,6 +17,9 @@ try:
         "compute_metrics",
         "setup_logger",
         "get_logger",
+        "BenchmarkConfig",
+        "EngineConfig",
+        "EvalConfig",
         "DiffulexLM",
     ]
 except ImportError:
@@ -25,5 +29,8 @@ except ImportError:
         "compute_metrics",
         "setup_logger",
         "get_logger",
+        "BenchmarkConfig",
+        "EngineConfig",
+        "EvalConfig",
     ]
 

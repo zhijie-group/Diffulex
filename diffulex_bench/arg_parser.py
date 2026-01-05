@@ -41,13 +41,13 @@ Examples:
     
     # Logging arguments
     parser.add_argument(
-        "--log_file",
+        "--log-file",
         type=str,
         default=None,
         help="Log file path (optional)",
     )
     parser.add_argument(
-        "--log_level",
+        "--log-level",
         type=str,
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],

@@ -2,6 +2,9 @@ import os
 
 from dataclasses import dataclass
 from transformers import AutoConfig
+from diffulex.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -56,7 +59,7 @@ class Config:
             if not self.lora_path:
                 raise ValueError("lora_path must be provided when use_lora is True")
             if not os.path.exists(self.lora_path):
-                print(f"Warning: LoRA path {self.lora_path} does not exist")
+                logger.warning(f"LoRA path {self.lora_path} does not exist")
 
         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         cfg_max_model_len = self.hf_config.max_position_embeddings if hasattr(self.hf_config, "max_position_embeddings") else self.hf_config.max_sequence_length

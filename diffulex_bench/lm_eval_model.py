@@ -15,7 +15,7 @@ from lm_eval.api.registry import register_model
 
 from diffulex import Diffulex, SamplingParams
 from diffulex_bench.runner import BenchmarkRunner
-from diffulex_bench.logger import setup_logger, get_logger
+from diffulex.logger import setup_logger, get_logger
 
 T = TypeVar("T", bound="LM")
 eval_logger = logging.getLogger(__name__)
@@ -91,8 +91,6 @@ class DiffulexLM(LM):
         self.all_generation_times = []
         self.all_nfe = []
         self.all_tokens = []
-        
-        self.logger.info("Initializing Diffulex engine...")
         
         # Initialize Diffulex runner
         self.runner = BenchmarkRunner(

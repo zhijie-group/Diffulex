@@ -59,33 +59,53 @@ python -m diffulex_bench.main \
 
 Configuration files are located in `diffulex_bench/configs/` directory. We use YAML format for better readability.
 
+### Configuration Structure
+
+Configurations are organized into two sections:
+
+1. **`engine`**: Engine configuration (model weights, LoRA, model name, strategy, inference parameters)
+2. **`eval`**: Evaluation configuration (dataset, tasks, sampling parameters, output settings)
+
 ### Example Configuration
 
 See `diffulex_bench/configs/example.yml` for a complete example:
 
 ```yaml
-# Model configuration
-model_path: "/path/to/your/model"
-model_name: "dream"
-decoding_strategy: "d2f"
-mask_token_id: 151666
+# Engine configuration - Parameters for Diffulex engine
+engine:
+  # Model and weights
+  model_path: "/path/to/your/model"
+  model_name: "dream"
+  decoding_strategy: "d2f"
+  mask_token_id: 151666
+  
+  # LoRA configuration
+  use_lora: false
+  lora_path: ""
+  
+  # Parallelism and memory
+  tensor_parallel_size: 1
+  data_parallel_size: 1
+  gpu_memory_utilization: 0.9
+  max_model_len: 2048
+  
+  # D2F-specific parameters
+  accept_threshold: 0.9
+  complete_threshold: 0.95
+  add_new_block_threshold: 0.1
 
-# Inference configuration
-tensor_parallel_size: 1
-data_parallel_size: 1
-gpu_memory_utilization: 0.9
-max_model_len: 2048
-
-# Sampling configuration
-temperature: 0.0
-max_tokens: 256
-
-# Dataset configuration
-dataset_name: "gsm8k"
-dataset_limit: 100
-
-# Output configuration
-output_dir: "benchmark_results"
+# Evaluation configuration - Parameters for benchmark
+eval:
+  # Task/Dataset
+  dataset_name: "gsm8k"
+  dataset_limit: 100
+  
+  # Sampling
+  temperature: 0.0
+  max_tokens: 256
+  
+  # Output
+  output_dir: "benchmark_results"
 ```
 
 ### Pre-configured Examples
@@ -122,14 +142,19 @@ See [lm-evaluation-harness tasks](https://github.com/EleutherAI/lm-evaluation-ha
 ### Example: Dream with D2F
 
 ```yaml
-model_path: "/path/to/dream/model"
-model_name: "dream"
-decoding_strategy: "d2f"
-mask_token_id: 151666
+engine:
+  model_path: "/path/to/dream/model"
+  model_name: "dream"
+  decoding_strategy: "d2f"
+  mask_token_id: 151666
+  accept_threshold: 0.9
+  complete_threshold: 0.95
+  add_new_block_threshold: 0.1
 
-accept_threshold: 0.9
-complete_threshold: 0.95
-add_new_block_threshold: 0.1
+eval:
+  dataset_name: "gsm8k"
+  temperature: 0.0
+  max_tokens: 256
 ```
 
 ## Command Line Arguments
@@ -252,10 +277,25 @@ from diffulex_bench.lm_eval_model import DiffulexLM
 ### Programmatic Usage
 
 ```python
-from diffulex_bench.config import BenchmarkConfig
+from diffulex_bench.config import BenchmarkConfig, EngineConfig, EvalConfig
 from diffulex_bench.main import run_benchmark
 
+# Load from YAML file
 config = BenchmarkConfig.from_yaml("diffulex_bench/configs/example.yml")
+run_benchmark(config)
+
+# Or create programmatically
+engine = EngineConfig(
+    model_path="/path/to/model",
+    model_name="dream",
+    decoding_strategy="d2f",
+)
+eval_config = EvalConfig(
+    dataset_name="gsm8k",
+    temperature=0.0,
+    max_tokens=256,
+)
+config = BenchmarkConfig(engine=engine, eval=eval_config)
 run_benchmark(config)
 ```
 

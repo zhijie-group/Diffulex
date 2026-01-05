@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from diffulex import Diffulex, SamplingParams
 from transformers import AutoTokenizer
-from diffulex_bench.logger import get_logger
+from diffulex.logger import get_logger
 
 
 class BenchmarkRunner:
