@@ -33,7 +33,10 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "pandas>=2.3.3",
-    "tilelang==0.1.7.post1"
+    "tilelang==0.1.7.post1",
+    "rich>=13.0.0",
+    "colorama>=0.4.6",
+    "lm-eval"
 ]
 
 [project.urls]
@@ -48,6 +51,7 @@ default = true
 [tool.setuptools.packages.find]
 include = [
     "diffulex",
+    "diffulex_bench",
     "diffulex_kernel",
     "diffulex_legacy",
     "test"
