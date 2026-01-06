@@ -3,10 +3,10 @@
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
-from transformers.utils import logging
 
+from diffulex.logger import get_logger
 
-logger = logging.get_logger(__name__)
+logger = get_logger(__name__)
 
 
 class SDARConfig(PretrainedConfig):

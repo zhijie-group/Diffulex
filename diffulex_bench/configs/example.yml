@@ -1,0 +1,52 @@
+# Diffulex Benchmark Configuration Example
+# This configuration uses nested structure with engine and eval sections
+
+# Engine configuration - Parameters for Diffulex engine initialization
+engine:
+  # Model and weights
+  model_path: "/path/to/your/model"
+  tokenizer_path: null  # Optional, defaults to model_path
+  model_name: "dream"  # Options: dream, sdar, fast_dllm_v2
+  decoding_strategy: "d2f"  # Options: d2f, block_diffusion, fast_dllm
+  mask_token_id: 151666
+  
+  # LoRA configuration
+  use_lora: false
+  lora_path: ""
+  
+  # Parallelism configuration
+  tensor_parallel_size: 1
+  data_parallel_size: 1
+  
+  # Memory and capacity configuration
+  gpu_memory_utilization: 0.9
+  max_model_len: 2048
+  max_num_batched_tokens: 4096
+  max_num_seqs: 128
+  
+  # Engine behavior configuration
+  enforce_eager: false
+  kv_cache_layout: "unified"  # Options: unified, distinct
+  
+  # D2F-specific configuration
+  accept_threshold: 0.9
+  complete_threshold: 0.95
+  add_new_block_threshold: 0.1
+  diffusion_block_size: 32
+
+# Evaluation configuration - Parameters for benchmark evaluation
+eval:
+  # Task/Dataset configuration
+  dataset_name: "gsm8k"  # Options: gsm8k, humaneval, etc.
+  dataset_split: "test"
+  dataset_limit: 100  # Optional, limit number of samples
+  
+  # Sampling configuration
+  temperature: 0.0
+  max_tokens: 256
+  ignore_eos: false
+  
+  # Output configuration
+  output_dir: "benchmark_results"
+  save_results: true
+  use_tqdm: true

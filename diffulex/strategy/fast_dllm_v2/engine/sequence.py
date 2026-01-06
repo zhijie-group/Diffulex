@@ -16,11 +16,13 @@ class FDV2BlockStatus(Enum):
 
 class FDV2SubBlockStatus(Enum):
     ACTIVE = auto()
+    TO_DUAL_CACHE = auto()
+    IN_DUAL_CACHE = auto()
 
 @dataclass
 class FDV2SubBlock:
-    pass
-
+    sub_block_id: int = 0
+    status: FDV2SubBlockStatus = FDV2SubBlockStatus.ACTIVE
 
 @dataclass
 class FDV2Block:

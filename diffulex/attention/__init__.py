@@ -20,7 +20,7 @@ def __getattr__(name):
         try:
             from .attn_impl import Attention
             return Attention
-        except e:
+        except Exception as e:
             raise ImportError(f"Failed to import diffulex.attention.attn_impl.Attention: {e}")
     if name == "fetch_attn_metadata":
         return metadata.fetch_attn_metadata

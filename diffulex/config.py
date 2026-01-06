@@ -1,7 +1,10 @@
 import os
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from transformers import AutoConfig
+from diffulex.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -31,9 +34,10 @@ class Config:
     master_addr: str = "localhost"
     master_port: int = 2333
     # Shared memory segment name for intra-TP RPC; must be unique per DP group.
-    shm_name: str = "diffuserve_shm"
+    shm_name: str = "diffulex_shm"
     # Start device index for this TP group (set by DP launcher).
     device_start: int = 0
+    device_ids: list[int] = field(default_factory=lambda: [])
     
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
@@ -56,9 +60,18 @@ class Config:
             if not self.lora_path:
                 raise ValueError("lora_path must be provided when use_lora is True")
             if not os.path.exists(self.lora_path):
-                print(f"Warning: LoRA path {self.lora_path} does not exist")
+                logger.warning(f"LoRA path {self.lora_path} does not exist")
 
         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         cfg_max_model_len = self.hf_config.max_position_embeddings if hasattr(self.hf_config, "max_position_embeddings") else self.hf_config.max_sequence_length
         self.max_model_len = min(self.max_model_len, cfg_max_model_len)
         assert self.max_num_batched_tokens >= self.max_model_len
+        
+        if not self.device_ids:
+            import torch
+            self.device_ids = (
+                [int(x) for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+                if os.environ.get("CUDA_VISIBLE_DEVICES", "")
+                else list(range(torch.cuda.device_count()))
+            )
+            logger.info(f"Using CUDA devices: {self.device_ids}")

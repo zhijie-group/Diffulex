@@ -14,6 +14,9 @@ from diffulex.engine.sequence import AutoSequence, SequenceBase
 from diffulex.attention.metadata import set_warming_up, reset_warming_up
 from diffulex.model import AutoModelForDiffusionLM
 from diffulex.engine.strategy_registry import DiffulexStrategyRegistry
+from diffulex.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class ModelRunnerBase(ABC):
@@ -29,8 +32,8 @@ class ModelRunnerBase(ABC):
 
         # Initialize model, sampler, and kv cache
         init_method = f"tcp://{config.master_addr}:{config.master_port}"
-        dist.init_process_group("nccl", init_method, world_size=self.world_size, rank=rank)
-        device_id = (getattr(config, "device_start", 0) or 0) + rank
+        dist.init_process_group("nccl", init_method, world_size=self.world_size, rank=rank, device_id=config.device_ids[rank])
+        device_id = (getattr(config, "device_start", 0) or 0) + rank + config.device_ids[rank]
         assert 0 <= device_id < torch.cuda.device_count(), f"Invalid device_id {device_id}."
         torch.cuda.set_device(device_id)
         default_dtype = torch.get_default_dtype()
@@ -120,7 +123,7 @@ class ModelRunnerBase(ABC):
         return AutoSampler.from_config(config)
     
     def _prefill_warmup(self):
-        print("Warming up prefill...")
+        logger.info("Warming up prefill...")
         max_num_batched_tokens, max_model_len = (
             self.config.max_num_batched_tokens,
             self.config.max_model_len,
@@ -134,7 +137,7 @@ class ModelRunnerBase(ABC):
         torch.cuda.empty_cache()
 
     def warmup_model(self):
-        print("Warming up model...")
+        logger.info("Warming up model...")
         set_warming_up(True)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -184,26 +187,22 @@ class ModelRunnerBase(ABC):
         except Exception:
             gpu_memory_utilization = config.gpu_memory_utilization
             while num_kvcache_blocks <= 200:
-                print(
-                    "Warning: GPU memory utilization "
-                    f"{gpu_memory_utilization} is too low to allocate kv cache. "
+                logger.warning(
+                    f"GPU memory utilization {gpu_memory_utilization} is too low to allocate kv cache. "
                     "Automatically adding 0.05."
                 )
                 gpu_memory_utilization += 0.05
                 num_kvcache_blocks = get_num_kvcache_blocks(gpu_memory_utilization)
-            print(
+            logger.info(
                 f"Set gpu_memory_utilization to {gpu_memory_utilization:.2f} "
                 "to allocate kv cache."
             )
             config.gpu_memory_utilization = gpu_memory_utilization
 
         config.num_kvcache_blocks = num_kvcache_blocks
-        print(
-            "Allocated {num_blocks} blocks of size {block_size} for kv cache on rank {rank}.".format(
-                num_blocks=config.num_kvcache_blocks,
-                block_size=self.block_size,
-                rank=self.rank,
-            )
+        logger.info(
+            f"Allocated {config.num_kvcache_blocks} blocks of size {self.block_size} "
+            f"for kv cache on rank {self.rank}."
         )
 
         if config.kv_cache_layout == "distinct":

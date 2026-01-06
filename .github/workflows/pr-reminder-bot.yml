@@ -5,6 +5,10 @@ on:
     types:
       - opened
 
+permissions:
+  issues: write
+  pull-requests: write
+
 jobs:
   remind:
     runs-on: ubuntu-latest

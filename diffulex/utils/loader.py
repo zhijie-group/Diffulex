@@ -8,6 +8,9 @@ from glob import glob
 from functools import partial
 from safetensors import safe_open
 from diffulex.config import Config
+from diffulex.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def load_lora_config(lora_path: str) -> dict:
@@ -47,10 +50,10 @@ def load_model(model: nn.Module, config: Config):
     if config.use_lora and config.lora_path:
         lora_config = load_lora_config(config.lora_path)
         if lora_config:
-            print(f"LoRA Config Loaded: {lora_config}")
+            logger.info(f"LoRA Config Loaded: {lora_config}")
             model = enable_lora_for_model(model, lora_config)
         else:
-            print("No adapter_config.json found, using default LoRA parameters")
+            logger.info("No adapter_config.json found, using default LoRA parameters")
             default_config = {'r': 16, 'lora_alpha': 32.0, 'lora_dropout': 0.0}
             model = enable_lora_for_model(model, default_config)
     
@@ -92,12 +95,12 @@ def load_model(model: nn.Module, config: Config):
     # Load LoRA weights if enabled
     if config.use_lora and config.lora_path:
         if os.path.exists(config.lora_path):
-            print(f"Loading LoRA weights from {config.lora_path}")
+            logger.info(f"Loading LoRA weights from {config.lora_path}")
             load_lora_weights_fn = partial(load_lora_weights, model, config.lora_path)
             packed_modules_mapping = packed_modules_mapping if config.model_name == "llada" else None
             model = load_lora_weights_fn(packed_modules_mapping=packed_modules_mapping)
         else:
-            print(f"Warning: LoRA path {config.lora_path} does not exist, skipping LoRA loading")
+            logger.warning(f"LoRA path {config.lora_path} does not exist, skipping LoRA loading")
     
     return model
 
@@ -189,16 +192,16 @@ def load_lora_weights(model: nn.Module, lora_path: str, packed_modules_mapping: 
                         module.lora_B.data.copy_(found_b)
                         applied_count += 1
                     except Exception as e:
-                        print(f"Failed to load LoRA weights for {name}: {e}")
+                        logger.warning(f"Failed to load LoRA weights for {name}: {e}")
         
         for module in model.modules():
             if hasattr(module, 'merge_lora'):
                 module.merge_lora()
         
-        print(f"LoRA weights applied to {applied_count} layers and merged")
+        logger.info(f"LoRA weights applied to {applied_count} layers and merged")
         
     except Exception as e:
-        print(f"Error loading LoRA weights: {e}")
-        print("Continuing with base model only")
+        logger.error(f"Error loading LoRA weights: {e}")
+        logger.warning("Continuing with base model only")
     
     return model
