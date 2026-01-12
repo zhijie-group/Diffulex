@@ -17,8 +17,11 @@ fetch_attn_metadata = _FetchAttnMetadataProxy()
 def __getattr__(name):
     """Lazy import to avoid circular deps during module init."""
     if name == "Attention":
-        from .attn_impl import Attention
-        return Attention
+        try:
+            from .attn_impl import Attention
+            return Attention
+        except Exception as e:
+            raise ImportError(f"Failed to import diffulex.attention.attn_impl.Attention: {e}")
     if name == "fetch_attn_metadata":
         return metadata.fetch_attn_metadata
     raise AttributeError(f"module {__name__} has no attribute {name}")

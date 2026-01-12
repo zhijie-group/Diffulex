@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from easydict import EasyDict as edict
 
 from diffulex.engine.sequence import SequenceBase
+from diffulex.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class SamplerBase(nn.Module):
@@ -93,7 +96,7 @@ class SamplerShiftLogits(SamplerBase):
     
     def _shift_logits(self, logits, last_logit=None):
         if logits.shape[1] == 0:
-            print("Warning: logits sequence length is 0, returning empty logits")
+            logger.warning("Logits sequence length is 0, returning empty logits")
             raise Exception("logits sequence length is 0")
             
         shifted_logits = torch.zeros_like(logits)

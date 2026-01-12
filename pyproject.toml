@@ -32,6 +32,11 @@ dependencies = [
     "matplotlib>=3.10.5",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
+    "pandas>=2.3.3",
+    "tilelang>=0.1.7.post1",
+    "rich>=13.0.0",
+    "colorama>=0.4.6",
+    "lm-eval"
 ]
 
 [project.urls]
@@ -39,13 +44,16 @@ Homepage = "https://github.com/zhijie-group/D2fEngine"
 Repository = "https://zhijie-group.github.io/D2fEngine"
 "Organization" = "https://github.com/zhijie-group"
 
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple"
+default = true
+
 [tool.setuptools.packages.find]
 include = [
     "diffulex",
+    "diffulex_bench",
     "diffulex_kernel",
     "diffulex_legacy",
+    "diffulex_profiler",
+    "test"
 ]
-
-[[tool.uv.index]]
-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-default = true

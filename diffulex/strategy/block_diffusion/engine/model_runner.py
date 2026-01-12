@@ -5,6 +5,7 @@ import time
 from multiprocessing.synchronize import Event
 
 import torch
+from tqdm import tqdm
 
 from diffulex.config import Config
 from diffulex.engine.sequence import SequenceBase
@@ -23,24 +24,6 @@ class BDModelRunner(ModelRunnerBase):
         self.mask_token_id = config.mask_token_id
         
         super().__init__(config, rank, event)
-        
-    def warmup_model(self):
-        print("Warming up model...")
-        set_warming_up(True)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = (
-            self.config.max_num_batched_tokens,
-            self.config.max_model_len,
-        )
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        test_input_ids = [0] * max_model_len
-        seqs = [BDSequence(test_input_ids, config=self.config) for _ in range(num_seqs)]
-        self.run(seqs, True)
-        for seq in seqs:
-            seq.post_process()
-        torch.cuda.empty_cache()
-        reset_warming_up()
 
     def prepare_prefill(self, seqs: list[BDSequence]):
         input_ids: list[int] = []
@@ -87,7 +70,6 @@ class BDModelRunner(ModelRunnerBase):
                     slot_mapping.extend([-1] * self.block_size)
 
         block_tables = self.prepare_block_tables(seqs)
-
         input_ids_tensor = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions_tensor = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -145,7 +127,7 @@ class BDModelRunner(ModelRunnerBase):
                 num_pages_storing = seq.num_page_blocks_in_active_diffusion_block
                 total_num_pages = len(seq.block_table)
                 for i in range(0, num_pages_storing):
-                    start = seq.block_table[total_num_pages - num_pages_storing + i] * self.block_size
+                    start = seq.block_table[(total_num_pages - 1) - num_pages_storing + i] * self.block_size
                     end = start + self.block_size
                     slot_mapping.extend(range(start, end))
                 
@@ -174,24 +156,24 @@ class BDModelRunner(ModelRunnerBase):
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill or self.enforce_eager or input_ids.size(0) > 512 * self.diffusion_block_size:
             return self.model.compute_logits(self.model(input_ids, positions))
         num_tokens = input_ids.size(0)
-        context = fetch_bd_attn_metadata()
+        attn_metadata = fetch_bd_attn_metadata()
         graph = self.graphs[next(x for x in self.graph_bs if x >= num_tokens)]
         graph_vars = self.graph_vars
         for key, value in graph_vars.items():
             if key != "outputs":
                 value.zero_()
         
-        num_seqs = len(context.context_lens)
+        num_seqs = len(attn_metadata.context_lens)
         graph_vars["input_ids"][:num_tokens] = input_ids
         graph_vars["positions"][:num_tokens] = positions
-        graph_vars["slot_mapping"][:num_tokens] = context.slot_mapping
-        graph_vars["context_lens"][:num_seqs] = context.context_lens
-        graph_vars["cu_seqlens_q"][:num_seqs + 1] = context.cu_seqlens_q
-        graph_vars["cu_seqlens_k"][:num_seqs + 1] = context.cu_seqlens_k
-        graph_vars["block_tables"][:num_seqs, : context.block_tables.size(1)] = context.block_tables
+        graph_vars["slot_mapping"][:num_tokens] = attn_metadata.slot_mapping
+        graph_vars["context_lens"][:num_seqs] = attn_metadata.context_lens
+        graph_vars["cu_seqlens_q"][:num_seqs + 1] = attn_metadata.cu_seqlens_q
+        graph_vars["cu_seqlens_k"][:num_seqs + 1] = attn_metadata.cu_seqlens_k
+        graph_vars["block_tables"][:num_seqs, : attn_metadata.block_tables.size(1)] = attn_metadata.block_tables
         graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:num_tokens])
 
@@ -205,6 +187,7 @@ class BDModelRunner(ModelRunnerBase):
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        set_warming_up(True)
         config = self.config
         hf_config = config.hf_config
         max_num_seqs = min(self.config.max_num_seqs, 512)
@@ -234,8 +217,8 @@ class BDModelRunner(ModelRunnerBase):
             self.graph_bs.append(num_seqs * diffusion_block_size)
         self.graphs = {}
         self.graph_pool = None
-
-        for num_tokens in reversed(self.graph_bs):
+        
+        for num_tokens in tqdm(reversed(self.graph_bs), desc="Capturing CUDA graphs"):
             num_seqs = num_tokens // diffusion_block_size
             graph = torch.cuda.CUDAGraph()
             
@@ -272,3 +255,4 @@ class BDModelRunner(ModelRunnerBase):
             block_tables=block_tables,
             outputs=outputs,
         )
+        reset_warming_up()

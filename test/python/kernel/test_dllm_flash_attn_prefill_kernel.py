@@ -7,7 +7,7 @@ import tilelang.testing
 import torch.nn.functional as F
 from einops import rearrange
 
-from diffulex_kernel.python.dllm_flash_attn import dllm_flash_attn_prefill_kernel
+from diffulex_kernel.python.dllm_flash_attn_kernels import dllm_flash_attn_prefill_kernel
 
 
 def naive_sdpa_prefill(
@@ -124,7 +124,7 @@ def run_dllm_flash_attn_prefill(
     )
 
     kernel_source = prefill_kernel.get_kernel_source()
-    cuda_cache_dir = os.getenv("CUDA_CACHE_DIR", "/data1/jyj/Diffulex/cuda_cache")
+    cuda_cache_dir = os.getenv("CUDA_CACHE_DIR", "./cuda_cache")
     cache_root = Path(cuda_cache_dir) / "test_dllm_flash_attn_prefill_kernel"
     case_dir = cache_root / (
         f"seq{num_seqs}_heads{num_heads}_kv{num_kv_heads}_hd{head_dim}_"

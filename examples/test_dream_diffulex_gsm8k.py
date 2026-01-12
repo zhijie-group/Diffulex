@@ -10,30 +10,6 @@ from viztracer import VizTracer
 from transformers import AutoTokenizer
 
 from diffulex import Diffulex, SamplingParams
-
-
-def summarize_profiling(csv_path: str) -> dict:
-    totals = {}
-    total_nums = {}
-    avgs = {}
-    with open(csv_path, 'r', newline='') as f:
-        reader = csv.dictReader(f)
-        for row in reader:
-            for k, v in row.items():
-                try:
-                    val = float(v)
-                except ValueError:
-                    continue
-                if val != 0.0:
-                    total_nums[k] = total_nums.get(k, 0) + 1
-                totals[k] = totals.get(k, 0.0) + val
-    print(pd.DataFrame([totals]).T)
-    for k, v in totals.items():
-        if k in total_nums and total_nums[k] > 0:
-            avgs[k] = v / total_nums[k]
-        else:
-            avgs[k] = 0.0
-    print(pd.DataFrame([avgs]).T)
     
 
 FEW_SHOTS="""
@@ -49,7 +25,7 @@ if __name__ == "__main__":
         use_lora=True,
         model_name="dream", 
         enforce_eager=True, 
-        data_parallel_size=1,
+        data_parallel_size=8,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.25,
         max_num_batched_tokens=2048,
@@ -86,6 +62,6 @@ if __name__ == "__main__":
           f"Avg TPS: {sum(len(o['token_ids']) for o in outputs) / (e - s):.2f} tok/s.\n"
           f"AVG Number of Diffusion Steps: {sum(o['n_diff_steps'] for o in outputs) / len(outputs):.2f}\n",
           "=*=" * 30)
-    # for idx, o in enumerate(outputs):
-    #     print("\n", "=*=" * 30)
-    #     print(f"[Prompt {idx} Result] \n{prompts[idx] + "\n-----<Start-of-Response>-----\n" + o['text']}\n")
+    for idx, o in enumerate(outputs):
+        print("\n", "=*=" * 30)
+        print(f"[Prompt {idx} Result] \n{prompts[idx] + "\n-----<Start-of-Response>-----\n" + o['text']}\n")

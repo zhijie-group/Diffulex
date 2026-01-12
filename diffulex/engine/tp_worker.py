@@ -12,6 +12,9 @@ from diffulex.sampling_params import SamplingParams
 from diffulex.engine.sequence import AutoSequence
 from diffulex.engine.scheduler import AutoScheduler, SchedulerBase
 from diffulex.engine.model_runner import AutoModelRunner
+from diffulex.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class DiffulexTPWorker:
@@ -118,7 +121,10 @@ class DiffulexTPWorker:
                 if use_tqdm:
                     pbar.update(1)
                     
-        print(f"Finished in {n_steps} steps, prefill throughput: {prefill_throughput:.2f} tok/s, decode throughput: {decode_throughput:.2f} tok/s")
+        logger.info(
+            f"Finished in {n_steps} steps, prefill throughput: {prefill_throughput:.2f} tok/s, "
+            f"decode throughput: {decode_throughput:.2f} tok/s"
+        )
         # Ensure all outputs are present
         assert all(toks is not None for toks in outputs), "Some sequences did not produce outputs"
         outputs = [{

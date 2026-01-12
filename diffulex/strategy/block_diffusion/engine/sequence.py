@@ -196,7 +196,7 @@ class BDSequence(SequenceBase):
         self.token_ids.extend([self.mask_token_id] * extend_len)
           
     def init_diffusion_blocks(self) -> None:
-        """Initialize diffusion blocks: prefix blocks are TO_CACHE, last block with mask tokens is ACTIVE."""
+        """Initialize diffusion blocks: prefix blocks are `TO_CACHE`, last block with mask tokens is `ACTIVE`."""
         self.prefix_len = len(self.token_ids)
         block_size = self.diffusion_block_size
         

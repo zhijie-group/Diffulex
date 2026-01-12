@@ -7,8 +7,7 @@ import tilelang.testing
 import torch.nn.functional as F
 from einops import rearrange
 
-# from diffulex_kernel.python.dllm_flash_attn import dllm_flash_attn_decode_kernel
-from diffulex_kernel.python.dllm_flash_attn import dllm_flash_attn_decode_kernel_legacy as dllm_flash_attn_decode_kernel
+from diffulex_kernel.python.dllm_flash_attn_kernels import dllm_flash_attn_decode_kernel
 
 
 def naive_sdpa_with_kvcache(
@@ -184,7 +183,7 @@ def run_dllm_flash_attn_decode(
     
     kernel_source = decode_kernel.get_kernel_source()
 
-    cuda_cache_dir = os.getenv("CUDA_CACHE_DIR", "/data1/jyj/Diffulex/cuda_cache")
+    cuda_cache_dir = os.getenv("CUDA_CACHE_DIR", "./cuda_cache")
     cache_root = Path(cuda_cache_dir) / "test_dllm_flash_attn_decode_kernel"
     case_dir = cache_root / (
         f"seq{num_seqs}_heads{num_heads}_kv{num_kv_heads}_hd{head_dim}_"
@@ -247,6 +246,23 @@ def test_decode_bf16_multi_seq():
         max_q_len=64,
         max_kv_len=64,
         context_len=256,
+        page_block_size=32,
+        diffusion_block_size=32,
+        is_block_attn=False,
+        dtype="bfloat16",
+    )
+
+
+def test_decode_bf16_multi_seq_long_context():
+    """Test with multiple sequences, bfloat16."""
+    run_dllm_flash_attn_decode(
+        num_seqs=4,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        max_q_len=64,
+        max_kv_len=64,
+        context_len=1024,
         page_block_size=32,
         diffusion_block_size=32,
         is_block_attn=False,

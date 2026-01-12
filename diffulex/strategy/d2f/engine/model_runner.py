@@ -25,24 +25,6 @@ class D2FModelRunner(ModelRunnerBase):
         
         super().__init__(config, rank, event)
 
-    def warmup_model(self):
-        print("Warming up model...")
-        set_warming_up(True)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = (
-            self.config.max_num_batched_tokens,
-            self.config.max_model_len,
-        )
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        test_input_ids = [0] * max_model_len
-        seqs = [D2FSequence(test_input_ids, config=self.config) for _ in range(num_seqs)]
-        self.run(seqs, True)
-        for seq in seqs:
-            seq.post_process()
-        torch.cuda.empty_cache()
-        reset_warming_up()
-
     def prepare_prefill(self, seqs: list[D2FSequence]):
         input_ids: list[int] = []
         positions: list[int] = []

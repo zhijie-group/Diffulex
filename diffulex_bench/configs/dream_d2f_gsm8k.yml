@@ -1,0 +1,29 @@
+# Dream model with D2F strategy on GSM8K dataset
+# Quick configuration example
+
+engine:
+  model_path: "/path/to/dream/model"
+  model_name: "dream"
+  decoding_strategy: "d2f"
+  mask_token_id: 151666
+  
+  tensor_parallel_size: 1
+  data_parallel_size: 1
+  gpu_memory_utilization: 0.9
+  max_model_len: 2048
+  
+  use_lora: false
+  enforce_eager: false
+  
+  accept_threshold: 0.9
+  complete_threshold: 0.95
+  add_new_block_threshold: 0.1
+
+eval:
+  dataset_name: "gsm8k"
+  dataset_limit: 100
+  
+  temperature: 0.0
+  max_tokens: 256
+  
+  output_dir: "benchmark_results"
