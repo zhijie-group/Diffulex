@@ -26,6 +26,11 @@ except ImportError:
     _TILELANG_AVAILABLE = False
     w8a16_gemm = None
 
+try:
+    from diffulex_kernel.python.linear_kernels import w8a16_gemm_bias
+except ImportError:
+    w8a16_gemm_bias = None
+
 
 @register_linear_strategy(weight_dtype="int8", act_dtype="bf16")
 def _build_linear_int8_w8a16() -> LinearQuantizationStrategy:
@@ -51,6 +56,55 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
         self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # Optional cache: weight_id -> bf16 dequantized weight (speed-first; uses extra memory)
         self._dequant_weight_cache: dict[int, torch.Tensor] = {}
+        # bias cache for fused-bias kernel (store fp16 copy on device)
+        self._bias_f16_cache: dict[int, torch.Tensor] = {}
+        # Lightweight runtime observability (opt-in by env var)
+        self._rt_call_count: int = 0
+        self._rt_fallback_count: int = 0
+        self._rt_m_hist_le64: dict[int, int] = {}
+
+    def _rt_enabled(self) -> bool:
+        return os.getenv("DIFFULEX_LINEAR_PROFILE", "0") == "1"
+
+    def _rt_log_every(self) -> int:
+        try:
+            return int(os.getenv("DIFFULEX_LINEAR_PROFILE_EVERY", "200"))
+        except Exception:
+            return 200
+
+    def _rt_on_call(self, *, m: int, n: int, k: int) -> None:
+        if not self._rt_enabled():
+            return
+        self._rt_call_count += 1
+        if m <= 64:
+            self._rt_m_hist_le64[m] = self._rt_m_hist_le64.get(m, 0) + 1
+        every = self._rt_log_every()
+        if every > 0 and (self._rt_call_count % every == 0):
+            top = sorted(self._rt_m_hist_le64.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+            top_str = ", ".join([f"M={mm}:{cc}" for mm, cc in top]) if top else "empty"
+            print(
+                f"[DIFFULEX_LINEAR_PROFILE][w8a16] calls={self._rt_call_count} "
+                f"fallbacks={self._rt_fallback_count} last(M,N,K)=({m},{n},{k}) "
+                f"M_hist_le64_top={top_str}",
+                flush=True,
+            )
+
+    def _rt_on_fallback(self, *, m: int, n: int, k: int, reason: str) -> None:
+        if not self._rt_enabled():
+            return
+        self._rt_fallback_count += 1
+        # Avoid spam: only print first few fallbacks, then rely on periodic summary.
+        max_print = 5
+        try:
+            max_print = int(os.getenv("DIFFULEX_LINEAR_FALLBACK_MAX_PRINT", "5"))
+        except Exception:
+            pass
+        if self._rt_fallback_count <= max_print:
+            print(
+                f"[DIFFULEX_LINEAR_PROFILE][w8a16][FALLBACK] "
+                f"count={self._rt_fallback_count} (M,N,K)=({m},{n},{k}) reason={reason}",
+                flush=True,
+            )
 
     @property
     def name(self) -> str:
@@ -256,6 +310,7 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                 M, K = x.shape
                 N, K_w = quantized_weight.shape
                 assert K == K_w, f"K dimension mismatch: {K} != {K_w}"
+                self._rt_on_call(m=M, n=N, k=K)
                 
                 # Reduce TileLang JIT compilation churn without killing small-M decode performance.
                 # Previous logic padded *any* M!=1 to 64/128/256, which can turn decode M=2/4 into M=64.
@@ -268,6 +323,13 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                         M_bucket = 1 << (M - 1).bit_length()
                     else:
                         M_bucket = ((M + 63) // 64) * 64
+                else:
+                    M_bucket = 1
+
+                # TileLang MMA GEMM requires M divisible by 16.
+                # For decode small-M (1/2/4/8), pad minimally to 16 (much cheaper than padding to 64).
+                if M_bucket < 16:
+                    M_bucket = 16
 
                 x_for_kernel = x
                 if M_bucket != M:
@@ -275,18 +337,63 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                     x_pad[:M, :] = x
                     x_for_kernel = x_pad
 
+                # Choose a small-M friendly block_M to reduce wasted work in decode.
+                # Keep variants bounded to avoid compilation churn and satisfy MMA constraints:
+                # use only {16, 32, 64} so M is always divisible by 16.
+                if M_bucket <= 16:
+                    block_m = 16
+                elif M_bucket <= 32:
+                    block_m = 32
+                else:
+                    block_m = 64
+
                 # Compile kernel (cached by TileLang) for the bucketed M.
                 # Note: keep a single tiling config to avoid exploding the number of compiled kernels
                 # (N/K vary by layer; adding more block_M variants can introduce mid-run compilations).
-                kernel = w8a16_gemm(M_bucket, N, K, block_M=64, block_N=64, block_K=128, num_stages=2, threads=128)
+                # NOTE: fused-bias kernel currently regresses decode throughput significantly on typical workloads.
+                # Keep it disabled by default; can be enabled for experimentation.
+                fuse_bias = os.getenv("DIFFULEX_W8A16_FUSE_BIAS", "0") == "1"
+                use_bias_kernel = fuse_bias and (bias is not None) and (w8a16_gemm_bias is not None)
+                if use_bias_kernel:
+                    kernel = w8a16_gemm_bias(
+                        M_bucket,
+                        N,
+                        K,
+                        block_M=block_m,
+                        block_N=64,
+                        block_K=128,
+                        num_stages=2,
+                        threads=128,
+                    )
+                else:
+                    kernel = w8a16_gemm(
+                        M_bucket,
+                        N,
+                        K,
+                        block_M=block_m,
+                        block_N=64,
+                        block_K=128,
+                        num_stages=2,
+                        threads=128,
+                    )
                 
                 # Call kernel - out_idx=[3] means output is the 4th parameter,
                 # so we only pass inputs (x, quantized_weight, scales), and kernel returns output
-                output_full = kernel(x_for_kernel, quantized_weight, scales)
+                if use_bias_kernel:
+                    # out_idx=[4] -> output is 5th arg (returned). Inputs: A, B, Scales, Bias
+                    # NOTE: kernel expects fp16 bias (see kernel signature).
+                    b_key = id(bias)
+                    b = self._bias_f16_cache.get(b_key)
+                    if b is None or b.device != x.device:
+                        b = bias.to(device=x.device, dtype=torch.float16)
+                        self._bias_f16_cache[b_key] = b
+                    output_full = kernel(x_for_kernel, quantized_weight, scales, b)
+                else:
+                    output_full = kernel(x_for_kernel, quantized_weight, scales)
                 output = output_full[:M, :] if M_bucket != M else output_full
                 
                 # Add bias if present
-                if bias is not None:
+                if (bias is not None) and (not use_bias_kernel):
                     output = output + bias
                 
                 return output
@@ -349,6 +456,13 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                         f"TileLang kernel failed, falling back to Python implementation: {error_msg}",
                         UserWarning,
                     )
+                # Count fallback and expose reason (opt-in).
+                try:
+                    m, k = x.shape
+                    n = int(quantized_weight.shape[0])
+                except Exception:
+                    m, n, k = -1, -1, -1
+                self._rt_on_fallback(m=m, n=n, k=k, reason=error_msg)
                 return self._fallback_python_forward(x, quantized_weight, scales, bias)
         else:
             # TileLang not available, use Python reference

@@ -173,6 +173,117 @@ def w8a16_gemm(
     return main
 
 
+@tilelang.jit(out_idx=[4])
+def w8a16_gemm_bias(
+    M: int,
+    N: int,
+    K: int,
+    block_M: int = 64,
+    block_N: int = 64,
+    block_K: int = 128,
+    num_stages: int = 2,
+    threads: int = 128,
+):
+    """W8A16 GEMM kernel with fused bias: bf16 activation × int8 weight -> bf16 output, then add bias.
+
+    Signature:
+        kernel(A: bf16[M,K], B: int8[N,K], Scales: bf16[N], Bias: bf16[N], C: bf16[M,N]) -> None
+    """
+    aligned = (M % block_M == 0) and (N % block_N == 0) and (K % block_K == 0)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), T.bfloat16),
+        B: T.Tensor((N, K), T.int8),
+        Scales: T.Tensor((N,), T.bfloat16),
+        # NOTE: keep Bias as fp16 to avoid adapter issues observed with 1D bf16 inputs.
+        Bias: T.Tensor((N,), T.float16),
+        C: T.Tensor((M, N), T.bfloat16),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            zero_i8 = tir.const(0, T.int8)
+            zero_bf16 = tir.const(0, T.bfloat16)
+
+            A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
+            B_shared = T.alloc_shared((block_N, block_K), T.int8)
+
+            B_local = T.alloc_fragment((block_N, block_K), T.int8)
+            B_bf16_local = T.alloc_fragment((block_N, block_K), T.bfloat16)
+            B_bf16_prev_local = T.alloc_fragment((block_N, block_K), T.bfloat16)
+
+            C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            C_out = T.alloc_fragment((block_M, block_N), T.bfloat16)
+
+            T.clear(C_local)
+
+            if aligned:
+                num_k_blocks = K // block_K
+                for k in T.Pipelined(num_k_blocks, num_stages=num_stages):
+                    T.copy(A[by * block_M, k * block_K], A_shared)
+                    T.copy(B[bx * block_N, k * block_K], B_shared)
+
+                    T.copy(B_shared, B_local)
+                    for i, j in T.Parallel(block_N, block_K):
+                        B_bf16_local[i, j] = B_local[i, j].astype(T.float32).astype(T.bfloat16)
+                    T.copy(B_bf16_local, B_bf16_prev_local)
+
+                    T.gemm(A_shared, B_bf16_prev_local, C_local, transpose_B=True)
+            else:
+                for k in T.Pipelined(0, T.ceildiv(K, block_K), num_stages=num_stages):
+                    for i, j in T.Parallel(block_M, block_K):
+                        m = by * block_M + i
+                        kk = k * block_K + j
+                        A_shared[i, j] = T.if_then_else(
+                            (m < M) & (kk < K),
+                            A[m, kk],
+                            zero_bf16,
+                        )
+                    for i, j in T.Parallel(block_N, block_K):
+                        n = bx * block_N + i
+                        kk = k * block_K + j
+                        B_shared[i, j] = T.if_then_else(
+                            (n < N) & (kk < K),
+                            B[n, kk],
+                            zero_i8,
+                        )
+
+                    T.copy(B_shared, B_local)
+                    for i, j in T.Parallel(block_N, block_K):
+                        B_bf16_local[i, j] = B_local[i, j].astype(T.float32).astype(T.bfloat16)
+                    T.copy(B_bf16_local, B_bf16_prev_local)
+
+                    T.gemm(A_shared, B_bf16_prev_local, C_local, transpose_B=True)
+
+            # Apply per-channel scale and bias at output:
+            # C[m,n] = (A@q^T)[m,n] * Scales[n] + Bias[n]
+            if aligned:
+                for i, j in T.Parallel(block_M, block_N):
+                    n = bx * block_N + j
+                    scale_f32 = Scales[n].astype(T.float32)
+                    bias_f32 = Bias[n].astype(T.float32)
+                    C_out[i, j] = (C_local[i, j] * scale_f32 + bias_f32).astype(T.bfloat16)
+                T.copy(
+                    C_out,
+                    C[
+                        by * block_M : (by + 1) * block_M,
+                        bx * block_N : (bx + 1) * block_N,
+                    ],
+                )
+            else:
+                for i, j in T.Parallel(block_M, block_N):
+                    m = by * block_M + i
+                    n = bx * block_N + j
+                    scale_bf16 = T.if_then_else(n < N, Scales[n], zero_bf16)
+                    bias_f16 = T.if_then_else(n < N, Bias[n], tir.const(0, T.float16))
+                    scale_f32 = scale_bf16.astype(T.float32)
+                    bias_f32 = bias_f16.astype(T.float32)
+                    val = (C_local[i, j] * scale_f32 + bias_f32).astype(T.bfloat16)
+                    if (m < M) & (n < N):
+                        C[m, n] = val
+
+    return main
+
+
 @tilelang.jit(out_idx=[3])
 def w4a16_gemm(
     M: int,

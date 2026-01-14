@@ -1,3 +1,4 @@
+import os
 import torch
 import tilelang
 import tilelang.language as T
@@ -705,11 +706,33 @@ def _dllm_flash_attn_decode_bf16(
             attn_metadata.max_seqlen_q,
         )
     elif attn_metadata.decode_mode == "varlen":
-        k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)
-        return flash_attn_varlen_func(q, k_comb, v_comb, 
-                                      attn_metadata.cu_seqlens_q, attn_metadata.cu_seqlens_k,
-                                      attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k,
-                                      softmax_scale=scale, block_table=None)
+        do_profile = os.getenv("DIFFULEX_PROFILE_KVCACHE", "0") == "1"
+        if do_profile and q.is_cuda:
+            e0, e1, e2 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)
+            e1.record()
+            out = flash_attn_varlen_func(
+                q, k_comb, v_comb,
+                attn_metadata.cu_seqlens_q, attn_metadata.cu_seqlens_k,
+                attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k,
+                softmax_scale=scale, block_table=None
+            )
+            e2.record()
+            e2.synchronize()
+            print(
+                f"[DIFFULEX_PROFILE_KVCACHE] decode(varlen,bf16kv) "
+                f"load_kvcache={e0.elapsed_time(e1):.3f}ms flash_attn={e1.elapsed_time(e2):.3f}ms"
+            )
+            return out
+        else:
+            k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)
+            return flash_attn_varlen_func(
+                q, k_comb, v_comb,
+                attn_metadata.cu_seqlens_q, attn_metadata.cu_seqlens_k,
+                attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k,
+                softmax_scale=scale, block_table=None
+            )
 
 
 def _dllm_flash_attn_decode_bf16_q_fp8_kv(
@@ -795,12 +818,34 @@ def _dllm_flash_attn_decode_bf16_q_fp8_kv(
                 )
             raise
     elif attn_metadata.decode_mode == "varlen":
-        # varlen模式使用load_kvcache（已在Python层处理FP8）
-        k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)
-        return flash_attn_varlen_func(q, k_comb, v_comb, 
-                                      attn_metadata.cu_seqlens_q, attn_metadata.cu_seqlens_k,
-                                      attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k,
-                                      softmax_scale=scale, block_table=None)
+        # varlen模式使用load_kvcache：FP8 反量化/scale 融合应在 load_kvcache 内完成（Triton fused kernel）
+        do_profile = os.getenv("DIFFULEX_PROFILE_KVCACHE", "0") == "1"
+        if do_profile and q.is_cuda:
+            e0, e1, e2 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)
+            e1.record()
+            out = flash_attn_varlen_func(
+                q, k_comb, v_comb,
+                attn_metadata.cu_seqlens_q, attn_metadata.cu_seqlens_k,
+                attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k,
+                softmax_scale=scale, block_table=None
+            )
+            e2.record()
+            e2.synchronize()
+            print(
+                f"[DIFFULEX_PROFILE_KVCACHE] decode(varlen,fp8kv) "
+                f"load_kvcache={e0.elapsed_time(e1):.3f}ms flash_attn={e1.elapsed_time(e2):.3f}ms"
+            )
+            return out
+        else:
+            k_comb, v_comb = load_kvcache(k_cache, v_cache, attn_metadata, k, v)
+            return flash_attn_varlen_func(
+                q, k_comb, v_comb,
+                attn_metadata.cu_seqlens_q, attn_metadata.cu_seqlens_k,
+                attn_metadata.max_seqlen_q, attn_metadata.max_seqlen_k,
+                softmax_scale=scale, block_table=None
+            )
     else:
         raise ValueError(f"Unsupported decode mode: {attn_metadata.decode_mode}")
 

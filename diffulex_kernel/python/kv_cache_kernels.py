@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 
 from typing import Tuple
+import os
 
 from diffulex.attention.metadata import AttnMetaDataBase
     
@@ -386,6 +387,113 @@ def load_kvcache_kernel_bf16(k_cache_ptr, v_cache_ptr,
             tl.store(v_out_ptr + offs_cur_kv_new_to_out, v_new)
 
 
+@triton.jit
+def load_kvcache_kernel_fp8_unified(
+    k_cache_ptr, v_cache_ptr,
+    k_scale_ptr, v_scale_ptr,
+    k_new_ptr, v_new_ptr,
+    block_table_ptr,
+    k_out_ptr, v_out_ptr,
+    seqlens_ptr, ctxlens_ptr,
+    cu_seqlens_q_ptr, cu_seqlens_k_ptr,
+    kv_cache_stride_nblks, kv_cache_stride_blk, kv_cache_stride_h, kv_cache_stride_d,
+    kv_new_stride_s, kv_new_stride_h, kv_new_stride_d,
+    block_table_stride_nseqs, block_table_stride_maxblks,
+    kv_out_stride_s, kv_out_stride_h, kv_out_stride_d,
+    ctxlens_stride, seqlens_stride,
+    cu_seqlens_q_stride, cu_seqlens_k_stride,
+    LAST_BLK_ID: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIFFUSION_BLOCK_SIZE: tl.constexpr,
+    KV_LOAD_UNROLL_FACTOR: tl.constexpr,
+):
+    """
+    Unified layout FP8 load kernel:
+    - Gather paged KV cache blocks using block_tables/context_lens (same as BF16 kernel)
+    - Dequantize FP8 -> BF16 and apply per-head scale inside kernel
+    - Also appends active KV (k_new/v_new) once at LAST_BLK_ID
+    """
+    seq_idx = tl.program_id(0)
+    local_blk_idx = tl.program_id(1)
+    kv_head_idx = tl.program_id(2)
+
+    off_local_blk = seq_idx * block_table_stride_nseqs + local_blk_idx * block_table_stride_maxblks
+    global_blk_idx = tl.load(block_table_ptr + off_local_blk)
+
+    # Per-head scales (float32)
+    k_scale = tl.load(k_scale_ptr + kv_head_idx).to(tl.float32)
+    v_scale = tl.load(v_scale_ptr + kv_head_idx).to(tl.float32)
+
+    if global_blk_idx != -1:
+        off_ctxlen = seq_idx * ctxlens_stride
+        global_ctxlen = tl.load(ctxlens_ptr + off_ctxlen)
+        cur_window_sz = (local_blk_idx + 1) * PAGE_SIZE
+        prev_window_sz = local_blk_idx * PAGE_SIZE
+        local_ctxlen = tl.where(global_ctxlen > cur_window_sz, PAGE_SIZE, global_ctxlen % PAGE_SIZE)
+        if global_ctxlen > prev_window_sz:
+            offs_kv_cache_seq = tl.arange(0, PAGE_SIZE)
+            offs_kv_cache_hdim = tl.arange(0, HEAD_DIM)
+            offs_kv_cache = (
+                global_blk_idx[None, :] * kv_cache_stride_nblks +
+                offs_kv_cache_seq[None, :] * kv_cache_stride_blk +
+                kv_head_idx * kv_cache_stride_h +
+                offs_kv_cache_hdim[:, None] * kv_cache_stride_d
+            )
+            kv_cache_mask = offs_kv_cache_seq[None, :] < local_ctxlen
+
+            # Load FP8 -> fp32, apply scale, store BF16
+            k_cache = tl.load(k_cache_ptr + offs_kv_cache, mask=kv_cache_mask, other=0.0).to(tl.float32) * k_scale
+            v_cache = tl.load(v_cache_ptr + offs_kv_cache, mask=kv_cache_mask, other=0.0).to(tl.float32) * v_scale
+            k_cache_bf16 = k_cache.to(tl.bfloat16)
+            v_cache_bf16 = v_cache.to(tl.bfloat16)
+
+            off_cu_seqlens_k = seq_idx * cu_seqlens_k_stride
+            kv_out_start_idx = tl.load(cu_seqlens_k_ptr + off_cu_seqlens_k)
+            cur_kv_cache_to_out_start_idx = kv_out_start_idx + prev_window_sz
+            offs_kv_cache_to_out = (
+                (cur_kv_cache_to_out_start_idx + offs_kv_cache_seq[None, :]) * kv_out_stride_s +
+                kv_head_idx * kv_out_stride_h +
+                offs_kv_cache_hdim[:, None] * kv_out_stride_d
+            )
+            tl.store(k_out_ptr + offs_kv_cache_to_out, k_cache_bf16, mask=kv_cache_mask)
+            tl.store(v_out_ptr + offs_kv_cache_to_out, v_cache_bf16, mask=kv_cache_mask)
+
+    # Load and store active KV only once when first meet
+    if local_blk_idx == LAST_BLK_ID:
+        off_cu_seqlens_q = seq_idx * cu_seqlens_q_stride
+        off_seqlens = seq_idx * seqlens_stride
+        kv_new_start_idx = tl.load(cu_seqlens_q_ptr + off_cu_seqlens_q)
+        active_seqlen = tl.load(seqlens_ptr + off_seqlens)
+
+        offs_kv_new_seq = tl.arange(0, DIFFUSION_BLOCK_SIZE)
+        offs_kv_new_hdim = tl.arange(0, HEAD_DIM)
+
+        for diff_blk_idx in tl.range(active_seqlen // DIFFUSION_BLOCK_SIZE, loop_unroll_factor=KV_LOAD_UNROLL_FACTOR):
+            off_diff_blk = diff_blk_idx * DIFFUSION_BLOCK_SIZE
+            cur_kv_new_start_idx = kv_new_start_idx + off_diff_blk
+            offs_cur_kv_new_seq = (
+                (cur_kv_new_start_idx + offs_kv_new_seq[None, :]) * kv_new_stride_s +
+                kv_head_idx * kv_new_stride_h +
+                offs_kv_new_hdim[:, None] * kv_new_stride_d
+            )
+            k_new = tl.load(k_new_ptr + offs_cur_kv_new_seq)
+            v_new = tl.load(v_new_ptr + offs_cur_kv_new_seq)
+
+            off_ctxlen = seq_idx * ctxlens_stride
+            off_cu_seqlens_k = seq_idx * cu_seqlens_k_stride
+            global_ctxlen = tl.load(ctxlens_ptr + off_ctxlen)
+            kv_out_start_idx = tl.load(cu_seqlens_k_ptr + off_cu_seqlens_k)
+            cur_kv_new_to_out_start_idx = global_ctxlen + kv_out_start_idx + off_diff_blk
+            offs_cur_kv_new_to_out = (
+                (cur_kv_new_to_out_start_idx + offs_kv_new_seq[None, :]) * kv_out_stride_s +
+                kv_head_idx * kv_out_stride_h +
+                offs_kv_new_hdim[:, None] * kv_out_stride_d
+            )
+            tl.store(k_out_ptr + offs_cur_kv_new_to_out, k_new)
+            tl.store(v_out_ptr + offs_cur_kv_new_to_out, v_new)
+
+
 def _load_kvcache_bf16(k_cache: torch.Tensor, v_cache: torch.Tensor,
                  attn_metadata: AttnMetaDataBase,
                  k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -546,7 +654,10 @@ def store_kvcache_distinct_layout(key: torch.Tensor, value: torch.Tensor,
 def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
                       attn_metadata: AttnMetaDataBase,
                       k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Helper function for FP8 load - dequantizes in Python and returns BF16.
+    """Helper function for FP8 load.
+
+    Unified layout will use a Triton fused kernel to gather+dequantize+apply-scale on-the-fly.
+    Distinct layout currently falls back to the Python dequant path.
     
     Supports both unified and distinct layouts:
     - Unified: [num_blocks, page_size, num_kv_heads, head_dim]
@@ -572,23 +683,87 @@ def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
     if is_unified:
         # Unified layout: [num_blocks, page_size, num_kv_heads, head_dim]
         N_BLOCKS, PAGE_SIZE, H_KV, HEAD_DIM = k_cache.shape
-        
-        # Dequantize cache: view uint8 storage as FP8 dtype, then dequantize
+
+        # Ensure Triton sees float8 element type (storage is uint8 view)
         k_cache_fp8 = strategy.view_kv_cache_for_kernels(k_cache)
         v_cache_fp8 = strategy.view_kv_cache_for_kernels(v_cache)
-        
-        # Convert to float32 for dequantization
-        k_cache_fp32 = k_cache_fp8.float()  # [num_blocks, page_size, num_kv_heads, head_dim]
-        v_cache_fp32 = v_cache_fp8.float()  # [num_blocks, page_size, num_kv_heads, head_dim]
-        
-        # Apply scale: k_cache_fp32 * k_scale (broadcast over head_dim)
-        # k_scale shape: [num_kv_heads] -> [1, 1, num_kv_heads, 1]
-        k_scale_broadcast = k_scale.view(1, 1, -1, 1)  # [1, 1, num_kv_heads, 1]
-        v_scale_broadcast = v_scale.view(1, 1, -1, 1)  # [1, 1, num_kv_heads, 1]
-        
-        k_cache_bf16 = (k_cache_fp32 * k_scale_broadcast).to(torch.bfloat16)
-        v_cache_bf16 = (v_cache_fp32 * v_scale_broadcast).to(torch.bfloat16)
+
+        NUM_SEQS, MAX_SEQ_BLOCKS = attn_metadata.block_tables.shape
+        ctxlens = attn_metadata.context_lens
+        seqlens = attn_metadata.seq_lens_ts
+        assert sum(seqlens) == k_new.shape[0]
+        DIFFUSION_BLOCK_SIZE = attn_metadata.seqs[0].diffusion_block_size
+        MAX_DIFFUSION_BLOCK_SIZE = max(seqlens)
+        assert MAX_DIFFUSION_BLOCK_SIZE % DIFFUSION_BLOCK_SIZE == 0
+
+        total_lens = ctxlens + seqlens
+        cu_seqlens_q = attn_metadata.cu_seqlens_q
+        cu_seqlens_k = attn_metadata.cu_seqlens_k
+        assert sum(total_lens) == cu_seqlens_k[-1]
+        assert cu_seqlens_q.shape == cu_seqlens_k.shape
+        assert cu_seqlens_q.shape[0] == NUM_SEQS + 1
+
+        kv_output_shape = (sum(total_lens).item(), H_KV, HEAD_DIM)
+        k_output = torch.empty(kv_output_shape, device=k_cache.device, dtype=torch.bfloat16)
+        v_output = torch.empty_like(k_output)
+
+        # Strides for unified cache: [stride(0), stride(1), stride(2), stride(3)]
+        kv_cache_stride_nblks, kv_cache_stride_blk, kv_cache_stride_h, kv_cache_stride_d = k_cache_fp8.stride()
+
+        GRID = (NUM_SEQS, MAX_SEQ_BLOCKS, H_KV)
+        load_kvcache_kernel_fp8_unified[GRID](
+            k_cache_fp8, v_cache_fp8,
+            k_scale, v_scale,
+            k_new, v_new,
+            attn_metadata.block_tables,
+            k_output, v_output,
+            seqlens, ctxlens,
+            cu_seqlens_q, cu_seqlens_k,
+            kv_cache_stride_nblks, kv_cache_stride_blk, kv_cache_stride_h, kv_cache_stride_d,
+            *k_new.stride(),
+            *attn_metadata.block_tables.stride(),
+            *k_output.stride(),
+            ctxlens.stride(0),
+            seqlens.stride(0),
+            cu_seqlens_q.stride(0),
+            cu_seqlens_k.stride(0),
+            LAST_BLK_ID=attn_metadata.block_tables.shape[-1] - 1,
+            HEAD_DIM=HEAD_DIM,
+            PAGE_SIZE=PAGE_SIZE,
+            DIFFUSION_BLOCK_SIZE=DIFFUSION_BLOCK_SIZE,
+            KV_LOAD_UNROLL_FACTOR=2,
+        )
+
+        # Optional correctness check: compare with the old Python dequant+BF16-gather reference
+        if os.getenv("DIFFULEX_DEBUG_FP8_LOAD_REF", "0") == "1":
+            # Avoid huge overhead accidentally
+            try:
+                total_tokens = int(sum(total_lens).item())
+            except Exception:
+                total_tokens = -1
+            if 0 <= total_tokens <= 4096:
+                # Reference dequantization (slow): full cache dequant in Python
+                k_cache_fp32 = k_cache_fp8.float()
+                v_cache_fp32 = v_cache_fp8.float()
+                k_scale_broadcast = k_scale.view(1, 1, -1, 1)
+                v_scale_broadcast = v_scale.view(1, 1, -1, 1)
+                k_cache_bf16_ref = (k_cache_fp32 * k_scale_broadcast).to(torch.bfloat16)
+                v_cache_bf16_ref = (v_cache_fp32 * v_scale_broadcast).to(torch.bfloat16)
+                k_ref, v_ref = _load_kvcache_bf16(k_cache_bf16_ref, v_cache_bf16_ref, attn_metadata, k_new, v_new)
+                max_diff_k = (k_ref - k_output).abs().max().item()
+                max_diff_v = (v_ref - v_output).abs().max().item()
+                print(f"[DIFFULEX_DEBUG_FP8_LOAD_REF] max_abs_diff k={max_diff_k:.6g} v={max_diff_v:.6g} (total_tokens={total_tokens})")
+                # Be strict: any mismatch likely indicates indexing/mask/scale bug.
+                if max_diff_k > 0 or max_diff_v > 0:
+                    raise RuntimeError(
+                        f"FP8 fused load mismatch: max_abs_diff k={max_diff_k} v={max_diff_v}. "
+                        "Set DIFFULEX_DEBUG_FP8_LOAD_REF=0 to disable."
+                    )
+
+        return k_output, v_output
     else:
+        # Reference path (slow): full-cache dequantization in Python then BF16 gather.
+        # Kept for correctness and for distinct layout until a fused kernel is implemented.
         # Distinct layout: k_cache [num_blks, h, hdim // x, blk_sz, x], v_cache [num_blks, h, hdim, blk_sz]
         # For distinct layout, we need to handle the different shapes
         # k_cache: [num_blks, h, hdim // x, blk_sz, x]
@@ -613,9 +788,7 @@ def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
         k_cache_bf16 = (k_cache_fp32 * k_scale_broadcast).to(torch.bfloat16)
         v_cache_bf16 = (v_cache_fp32 * v_scale_broadcast).to(torch.bfloat16)
     
-    # Now use the BF16 load logic with the dequantized cache
-    # Note: _load_kvcache_bf16 expects unified layout shape, but it uses stride-based access
-    # so it should work with distinct layout as long as the stride information is correct
+    # Fallback: reuse BF16 gather logic with the dequantized cache
     return _load_kvcache_bf16(k_cache_bf16, v_cache_bf16, attn_metadata, k_new, v_new)
 
 
