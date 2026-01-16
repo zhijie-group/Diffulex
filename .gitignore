@@ -52,5 +52,7 @@ tilelang_optimization_analysis.md
 boundary_check_comparison.md
 GITHUB_ISSUE.md
 Tilelang-failed_test_cases/
+# Benchmark results
+benchmark_results/
 # Cursor IDE files
 .cursor/

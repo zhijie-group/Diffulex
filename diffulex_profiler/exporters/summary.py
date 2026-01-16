@@ -57,6 +57,13 @@ class SummaryExporter(ProfilerExporter):
             if m.backend_data and m.backend_data.get("backend") == "viztracer":
                 output_file = m.backend_data.get("output_file", "N/A")
                 summary_lines.append(f"  VizTracer Output: {output_file}")
+            if m.backend_data and m.backend_data.get("backend") == "pytorch":
+                trace_file = m.backend_data.get("trace_file", "N/A")
+                stacks_file = m.backend_data.get("stacks_file", "N/A")
+                top_table_file = m.backend_data.get("top_table_file", "N/A")
+                summary_lines.append(f"  PyTorch Trace: {trace_file}")
+                summary_lines.append(f"  PyTorch Stacks: {stacks_file}")
+                summary_lines.append(f"  PyTorch Top Table: {top_table_file}")
         
         summary_lines.append("")
         summary_lines.append("=" * 80)

@@ -202,6 +202,21 @@ class D2FModelRunner(ModelRunnerBase):
                         cur_diffusion_block_start = 0
                         cur_diffusion_block_end = step
                         start_idx += step
+                        # IMPORTANT:
+                        # We must have a KV-cache block allocated for this mem_block_idx.
+                        # If not, this is almost always due to insufficient KV cache blocks
+                        # (e.g. higher model/weight memory footprint leaves too few blocks).
+                        if mem_block_idx >= len(seq.block_table):
+                            raise RuntimeError(
+                                "KV cache block allocation is insufficient during decode: "
+                                f"mem_block_idx={mem_block_idx} requires block_table length >= {mem_block_idx + 1}, "
+                                f"but got len(block_table)={len(seq.block_table)} (seq.num_blocks={seq.num_blocks}). "
+                                "This usually means GPU memory utilization is too low to allocate enough KV cache "
+                                f"blocks for this run (num_kvcache_blocks={getattr(self.config, 'num_kvcache_blocks', None)}, "
+                                f"gpu_memory_utilization={getattr(self.config, 'gpu_memory_utilization', None)}). "
+                                "Try increasing gpu_memory_utilization, reducing max_model_len/max_tokens/max_num_seqs, "
+                                "or using a lower-memory weight quantization (e.g. int4)."
+                            )
                         mem_block_start = (
                             seq.block_table[mem_block_idx] * self.block_size
                             + context_len % seq.block_size
@@ -246,13 +261,12 @@ class D2FModelRunner(ModelRunnerBase):
         context_lens_tensor = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
         # NOTE:
-        # - d2f decode currently uses "varlen" mode by default.
-        # - When kv_cache_dtype is FP8, "varlen" decode falls back to Python dequantization via
-        #   `load_kvcache`, which can materialize large intermediate tensors and often makes FP8
-        #   KV *slower* than BF16.
-        # - Prefer TileLang's BF16Q+FP8KV decode kernel path by switching to "static" mode when
-        #   FP8 KV is enabled.
-        # - Allow manual override via config.decode_mode if specified
+        # - d2f decode supports "varlen" and "static" modes (see config.decode_mode).
+        # - For FP8 KV, the (varlen/distinct-layout) path uses `load_kvcache` which is expected to
+        #   handle FP8 dequantization / scale application inside the fused operator (no Python-level dequant).
+        # - Performance can still differ between modes/kernels; when FP8 KV is enabled, prefer the
+        #   best-supported kernel path on your stack (often "static"/unified-layout) and validate with profiling.
+        # - Allow manual override via config.decode_mode if specified.
         decode_mode = self._get_decode_mode()
         set_d2f_attn_metadata(
             False,

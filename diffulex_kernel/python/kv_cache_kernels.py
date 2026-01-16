@@ -388,6 +388,280 @@ def load_kvcache_kernel_bf16(k_cache_ptr, v_cache_ptr,
 
 
 @triton.jit
+def load_kvcache_kernel_bf16_distinct(
+    k_cache_ptr,
+    v_cache_ptr,
+    k_new_ptr,
+    v_new_ptr,
+    block_table_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    seqlens_ptr,
+    ctxlens_ptr,
+    cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
+    # distinct cache strides
+    k_cache_stride_nblks,
+    k_cache_stride_h,
+    k_cache_stride_dx,
+    k_cache_stride_blk_sz,
+    k_cache_stride_x,
+    v_cache_stride_nblks,
+    v_cache_stride_h,
+    v_cache_stride_d,
+    v_cache_stride_blk_sz,
+    # new / out / block_table strides
+    kv_new_stride_s,
+    kv_new_stride_h,
+    kv_new_stride_d,
+    block_table_stride_nseqs,
+    block_table_stride_maxblks,
+    kv_out_stride_s,
+    kv_out_stride_h,
+    kv_out_stride_d,
+    ctxlens_stride,
+    seqlens_stride,
+    cu_seqlens_q_stride,
+    cu_seqlens_k_stride,
+    LAST_BLK_ID: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIFFUSION_BLOCK_SIZE: tl.constexpr,
+    KV_LOAD_UNROLL_FACTOR: tl.constexpr,
+    X: tl.constexpr,
+):
+    """
+    Distinct layout BF16 load kernel.
+
+    Layouts:
+    - k_cache: [NBlks, Hkv, HEAD_DIM//X, PAGE_SIZE, X]
+    - v_cache: [NBlks, Hkv, HEAD_DIM, PAGE_SIZE]
+    """
+    seq_idx = tl.program_id(0)
+    local_blk_idx = tl.program_id(1)
+    kv_head_idx = tl.program_id(2)
+
+    off_local_blk = seq_idx * block_table_stride_nseqs + local_blk_idx * block_table_stride_maxblks
+    global_blk_idx = tl.load(block_table_ptr + off_local_blk)
+
+    if global_blk_idx != -1:
+        off_ctxlen = seq_idx * ctxlens_stride
+        global_ctxlen = tl.load(ctxlens_ptr + off_ctxlen)
+        cur_window_sz = (local_blk_idx + 1) * PAGE_SIZE
+        prev_window_sz = local_blk_idx * PAGE_SIZE
+        local_ctxlen = tl.where(global_ctxlen > cur_window_sz, PAGE_SIZE, global_ctxlen % PAGE_SIZE)
+        if global_ctxlen > prev_window_sz:
+            offs_kv_cache_seq = tl.arange(0, PAGE_SIZE)
+            offs_kv_cache_hdim = tl.arange(0, HEAD_DIM)
+
+            x_ids = offs_kv_cache_hdim // X
+            x_offs = offs_kv_cache_hdim % X
+
+            offs_k = (
+                global_blk_idx * k_cache_stride_nblks
+                + kv_head_idx * k_cache_stride_h
+                + x_ids[:, None] * k_cache_stride_dx
+                + offs_kv_cache_seq[None, :] * k_cache_stride_blk_sz
+                + x_offs[:, None] * k_cache_stride_x
+            )
+            offs_v = (
+                global_blk_idx * v_cache_stride_nblks
+                + kv_head_idx * v_cache_stride_h
+                + offs_kv_cache_hdim[:, None] * v_cache_stride_d
+                + offs_kv_cache_seq[None, :] * v_cache_stride_blk_sz
+            )
+
+            kv_cache_mask = offs_kv_cache_seq[None, :] < local_ctxlen
+            k_cache = tl.load(k_cache_ptr + offs_k, mask=kv_cache_mask, other=0.0)
+            v_cache = tl.load(v_cache_ptr + offs_v, mask=kv_cache_mask, other=0.0)
+
+            off_cu_seqlens_k = seq_idx * cu_seqlens_k_stride
+            kv_out_start_idx = tl.load(cu_seqlens_k_ptr + off_cu_seqlens_k)
+            cur_kv_cache_to_out_start_idx = kv_out_start_idx + prev_window_sz
+            offs_kv_cache_to_out = (
+                (cur_kv_cache_to_out_start_idx + offs_kv_cache_seq[None, :]) * kv_out_stride_s
+                + kv_head_idx * kv_out_stride_h
+                + offs_kv_cache_hdim[:, None] * kv_out_stride_d
+            )
+            tl.store(k_out_ptr + offs_kv_cache_to_out, k_cache, mask=kv_cache_mask)
+            tl.store(v_out_ptr + offs_kv_cache_to_out, v_cache, mask=kv_cache_mask)
+
+    if local_blk_idx == LAST_BLK_ID:
+        off_cu_seqlens_q = seq_idx * cu_seqlens_q_stride
+        off_seqlens = seq_idx * seqlens_stride
+        kv_new_start_idx = tl.load(cu_seqlens_q_ptr + off_cu_seqlens_q)
+        active_seqlen = tl.load(seqlens_ptr + off_seqlens)
+
+        offs_kv_new_seq = tl.arange(0, DIFFUSION_BLOCK_SIZE)
+        offs_kv_new_hdim = tl.arange(0, HEAD_DIM)
+
+        for diff_blk_idx in tl.range(active_seqlen // DIFFUSION_BLOCK_SIZE, loop_unroll_factor=KV_LOAD_UNROLL_FACTOR):
+            off_diff_blk = diff_blk_idx * DIFFUSION_BLOCK_SIZE
+            cur_kv_new_start_idx = kv_new_start_idx + off_diff_blk
+            offs_cur_kv_new_seq = (
+                (cur_kv_new_start_idx + offs_kv_new_seq[None, :]) * kv_new_stride_s
+                + kv_head_idx * kv_new_stride_h
+                + offs_kv_new_hdim[:, None] * kv_new_stride_d
+            )
+            k_new = tl.load(k_new_ptr + offs_cur_kv_new_seq)
+            v_new = tl.load(v_new_ptr + offs_cur_kv_new_seq)
+
+            off_ctxlen = seq_idx * ctxlens_stride
+            off_cu_seqlens_k = seq_idx * cu_seqlens_k_stride
+            global_ctxlen = tl.load(ctxlens_ptr + off_ctxlen)
+            kv_out_start_idx = tl.load(cu_seqlens_k_ptr + off_cu_seqlens_k)
+            cur_kv_new_to_out_start_idx = global_ctxlen + kv_out_start_idx + off_diff_blk
+            offs_cur_kv_new_to_out = (
+                (cur_kv_new_to_out_start_idx + offs_kv_new_seq[None, :]) * kv_out_stride_s
+                + kv_head_idx * kv_out_stride_h
+                + offs_kv_new_hdim[:, None] * kv_out_stride_d
+            )
+            tl.store(k_out_ptr + offs_cur_kv_new_to_out, k_new)
+            tl.store(v_out_ptr + offs_cur_kv_new_to_out, v_new)
+
+
+@triton.jit
+def load_kvcache_kernel_fp8_distinct(
+    k_cache_ptr,
+    v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    k_new_ptr,
+    v_new_ptr,
+    block_table_ptr,
+    k_out_ptr,
+    v_out_ptr,
+    seqlens_ptr,
+    ctxlens_ptr,
+    cu_seqlens_q_ptr,
+    cu_seqlens_k_ptr,
+    # distinct cache strides
+    k_cache_stride_nblks,
+    k_cache_stride_h,
+    k_cache_stride_dx,
+    k_cache_stride_blk_sz,
+    k_cache_stride_x,
+    v_cache_stride_nblks,
+    v_cache_stride_h,
+    v_cache_stride_d,
+    v_cache_stride_blk_sz,
+    # new / out / block_table strides
+    kv_new_stride_s,
+    kv_new_stride_h,
+    kv_new_stride_d,
+    block_table_stride_nseqs,
+    block_table_stride_maxblks,
+    kv_out_stride_s,
+    kv_out_stride_h,
+    kv_out_stride_d,
+    ctxlens_stride,
+    seqlens_stride,
+    cu_seqlens_q_stride,
+    cu_seqlens_k_stride,
+    LAST_BLK_ID: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIFFUSION_BLOCK_SIZE: tl.constexpr,
+    KV_LOAD_UNROLL_FACTOR: tl.constexpr,
+    X: tl.constexpr,
+):
+    """
+    Distinct layout FP8 load kernel:
+    - Gather paged KV cache blocks from distinct K/V layouts.
+    - Dequantize FP8 -> BF16 and apply per-head scale inside kernel.
+
+    Layouts:
+    - k_cache: [NBlks, Hkv, HEAD_DIM//X, PAGE_SIZE, X] (float8 view)
+    - v_cache: [NBlks, Hkv, HEAD_DIM, PAGE_SIZE] (float8 view)
+    """
+    seq_idx = tl.program_id(0)
+    local_blk_idx = tl.program_id(1)
+    kv_head_idx = tl.program_id(2)
+
+    off_local_blk = seq_idx * block_table_stride_nseqs + local_blk_idx * block_table_stride_maxblks
+    global_blk_idx = tl.load(block_table_ptr + off_local_blk)
+
+    k_scale = tl.load(k_scale_ptr + kv_head_idx).to(tl.float32)
+    v_scale = tl.load(v_scale_ptr + kv_head_idx).to(tl.float32)
+
+    if global_blk_idx != -1:
+        off_ctxlen = seq_idx * ctxlens_stride
+        global_ctxlen = tl.load(ctxlens_ptr + off_ctxlen)
+        cur_window_sz = (local_blk_idx + 1) * PAGE_SIZE
+        prev_window_sz = local_blk_idx * PAGE_SIZE
+        local_ctxlen = tl.where(global_ctxlen > cur_window_sz, PAGE_SIZE, global_ctxlen % PAGE_SIZE)
+        if global_ctxlen > prev_window_sz:
+            offs_kv_cache_seq = tl.arange(0, PAGE_SIZE)
+            offs_kv_cache_hdim = tl.arange(0, HEAD_DIM)
+
+            x_ids = offs_kv_cache_hdim // X
+            x_offs = offs_kv_cache_hdim % X
+
+            offs_k = (
+                global_blk_idx * k_cache_stride_nblks
+                + kv_head_idx * k_cache_stride_h
+                + x_ids[:, None] * k_cache_stride_dx
+                + offs_kv_cache_seq[None, :] * k_cache_stride_blk_sz
+                + x_offs[:, None] * k_cache_stride_x
+            )
+            offs_v = (
+                global_blk_idx * v_cache_stride_nblks
+                + kv_head_idx * v_cache_stride_h
+                + offs_kv_cache_hdim[:, None] * v_cache_stride_d
+                + offs_kv_cache_seq[None, :] * v_cache_stride_blk_sz
+            )
+
+            kv_cache_mask = offs_kv_cache_seq[None, :] < local_ctxlen
+            k_cache = tl.load(k_cache_ptr + offs_k, mask=kv_cache_mask, other=0.0).to(tl.float32) * k_scale
+            v_cache = tl.load(v_cache_ptr + offs_v, mask=kv_cache_mask, other=0.0).to(tl.float32) * v_scale
+            k_cache_bf16 = k_cache.to(tl.bfloat16)
+            v_cache_bf16 = v_cache.to(tl.bfloat16)
+
+            off_cu_seqlens_k = seq_idx * cu_seqlens_k_stride
+            kv_out_start_idx = tl.load(cu_seqlens_k_ptr + off_cu_seqlens_k)
+            cur_kv_cache_to_out_start_idx = kv_out_start_idx + prev_window_sz
+            offs_kv_cache_to_out = (
+                (cur_kv_cache_to_out_start_idx + offs_kv_cache_seq[None, :]) * kv_out_stride_s
+                + kv_head_idx * kv_out_stride_h
+                + offs_kv_cache_hdim[:, None] * kv_out_stride_d
+            )
+            tl.store(k_out_ptr + offs_kv_cache_to_out, k_cache_bf16, mask=kv_cache_mask)
+            tl.store(v_out_ptr + offs_kv_cache_to_out, v_cache_bf16, mask=kv_cache_mask)
+
+    if local_blk_idx == LAST_BLK_ID:
+        off_cu_seqlens_q = seq_idx * cu_seqlens_q_stride
+        off_seqlens = seq_idx * seqlens_stride
+        kv_new_start_idx = tl.load(cu_seqlens_q_ptr + off_cu_seqlens_q)
+        active_seqlen = tl.load(seqlens_ptr + off_seqlens)
+
+        offs_kv_new_seq = tl.arange(0, DIFFUSION_BLOCK_SIZE)
+        offs_kv_new_hdim = tl.arange(0, HEAD_DIM)
+
+        for diff_blk_idx in tl.range(active_seqlen // DIFFUSION_BLOCK_SIZE, loop_unroll_factor=KV_LOAD_UNROLL_FACTOR):
+            off_diff_blk = diff_blk_idx * DIFFUSION_BLOCK_SIZE
+            cur_kv_new_start_idx = kv_new_start_idx + off_diff_blk
+            offs_cur_kv_new_seq = (
+                (cur_kv_new_start_idx + offs_kv_new_seq[None, :]) * kv_new_stride_s
+                + kv_head_idx * kv_new_stride_h
+                + offs_kv_new_hdim[:, None] * kv_new_stride_d
+            )
+            k_new = tl.load(k_new_ptr + offs_cur_kv_new_seq)
+            v_new = tl.load(v_new_ptr + offs_cur_kv_new_seq)
+
+            off_ctxlen = seq_idx * ctxlens_stride
+            off_cu_seqlens_k = seq_idx * cu_seqlens_k_stride
+            global_ctxlen = tl.load(ctxlens_ptr + off_ctxlen)
+            kv_out_start_idx = tl.load(cu_seqlens_k_ptr + off_cu_seqlens_k)
+            cur_kv_new_to_out_start_idx = global_ctxlen + kv_out_start_idx + off_diff_blk
+            offs_cur_kv_new_to_out = (
+                (cur_kv_new_to_out_start_idx + offs_kv_new_seq[None, :]) * kv_out_stride_s
+                + kv_head_idx * kv_out_stride_h
+                + offs_kv_new_hdim[:, None] * kv_out_stride_d
+            )
+            tl.store(k_out_ptr + offs_cur_kv_new_to_out, k_new)
+            tl.store(v_out_ptr + offs_cur_kv_new_to_out, v_new)
+
+@triton.jit
 def load_kvcache_kernel_fp8_unified(
     k_cache_ptr, v_cache_ptr,
     k_scale_ptr, v_scale_ptr,
@@ -544,51 +818,57 @@ def _load_kvcache_bf16(k_cache: torch.Tensor, v_cache: torch.Tensor,
     v_output = torch.empty_like(k_output)
     
     GRID = (NUM_SEQS, MAX_SEQ_BLOCKS, H_KV)
-    
-    # Kernel expects 4 stride values for cache: [stride_nblks, stride_blk, stride_h, stride_d]
+
     if is_unified:
-        # Unified: [num_blocks, page_size, num_kv_heads, head_dim]
-        # stride: [stride(0), stride(1), stride(2), stride(3)]
+        # Unified cache: [NBlks, BlkSz, Hkv, Hdim]
         kv_cache_stride_nblks, kv_cache_stride_blk, kv_cache_stride_h, kv_cache_stride_d = k_cache.stride()
-        # v_cache has same shape, so same stride
+        load_kvcache_kernel_bf16[GRID](
+            k_cache, v_cache,
+            k_new, v_new,
+            attn_metadata.block_tables,
+            k_output, v_output,
+            seqlens, ctxlens,
+            cu_seqlens_q, cu_seqlens_k,
+            kv_cache_stride_nblks, kv_cache_stride_blk, kv_cache_stride_h, kv_cache_stride_d,
+            *k_new.stride(),
+            *attn_metadata.block_tables.stride(),
+            *k_output.stride(),
+            ctxlens.stride(0),
+            seqlens.stride(0),
+            cu_seqlens_q.stride(0),
+            cu_seqlens_k.stride(0),
+            LAST_BLK_ID=attn_metadata.block_tables.shape[-1] - 1,
+            HEAD_DIM=HEAD_DIM,
+            PAGE_SIZE=PAGE_SIZE,
+            DIFFUSION_BLOCK_SIZE=DIFFUSION_BLOCK_SIZE,
+            KV_LOAD_UNROLL_FACTOR=2,
+        )
     else:
-        # Distinct: k_cache [num_blks, h, hdim // x, blk_sz, x], v_cache [num_blks, h, hdim, blk_sz]
-        # Kernel expects: stride_nblks, stride_blk, stride_h, stride_d
-        # For distinct layout, we need to map the 5D/4D strides to the 4 stride values
-        # stride_nblks = stride(0) for blocks dimension
-        # stride_blk = stride(3) for k_cache (blk_sz dimension), stride(3) for v_cache
-        # stride_h = stride(1) for head dimension
-        # stride_d = stride(2) * stride(4) for k_cache (hdim dimension), stride(2) for v_cache
-        kv_cache_stride_nblks = k_cache.stride(0)
-        kv_cache_stride_blk = k_cache.stride(3)  # blk_sz dimension
-        kv_cache_stride_h = k_cache.stride(1)  # head dimension
-        # For k_cache: stride_d should account for the split dimension (hdim // x, x)
-        # The kernel accesses head_dim elements, so stride_d = stride(2) * x + stride(4)
-        # But actually, for distinct layout, the kernel uses stride_d to access head_dim
-        # Let's use v_cache's stride(2) which is the head_dim stride
-        kv_cache_stride_d = v_cache.stride(2)  # head_dim stride from v_cache
-    
-    load_kvcache_kernel_bf16[GRID](
-        k_cache, v_cache,
-        k_new, v_new,
-        attn_metadata.block_tables,
-        k_output, v_output,
-        seqlens, ctxlens,
-        cu_seqlens_q, cu_seqlens_k,
-        kv_cache_stride_nblks, kv_cache_stride_blk, kv_cache_stride_h, kv_cache_stride_d,
-        *k_new.stride(),
-        *attn_metadata.block_tables.stride(),
-        *k_output.stride(),
-        ctxlens.stride(0),
-        seqlens.stride(0),
-        cu_seqlens_q.stride(0),
-        cu_seqlens_k.stride(0),
-        LAST_BLK_ID=attn_metadata.block_tables.shape[-1] - 1,
-        HEAD_DIM=HEAD_DIM,
-        PAGE_SIZE=PAGE_SIZE,
-        DIFFUSION_BLOCK_SIZE=DIFFUSION_BLOCK_SIZE,
-        KV_LOAD_UNROLL_FACTOR=2
-    )
+        # Distinct cache needs a dedicated gather kernel due to K split layout.
+        x = int(k_cache.shape[-1])
+        load_kvcache_kernel_bf16_distinct[GRID](
+            k_cache, v_cache,
+            k_new, v_new,
+            attn_metadata.block_tables,
+            k_output, v_output,
+            seqlens, ctxlens,
+            cu_seqlens_q, cu_seqlens_k,
+            *k_cache.stride(),
+            *v_cache.stride(),
+            *k_new.stride(),
+            *attn_metadata.block_tables.stride(),
+            *k_output.stride(),
+            ctxlens.stride(0),
+            seqlens.stride(0),
+            cu_seqlens_q.stride(0),
+            cu_seqlens_k.stride(0),
+            LAST_BLK_ID=attn_metadata.block_tables.shape[-1] - 1,
+            HEAD_DIM=HEAD_DIM,
+            PAGE_SIZE=PAGE_SIZE,
+            DIFFUSION_BLOCK_SIZE=DIFFUSION_BLOCK_SIZE,
+            KV_LOAD_UNROLL_FACTOR=2,
+            X=x,
+        )
     
     return k_output, v_output
 
@@ -656,8 +936,8 @@ def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
                       k_new: torch.Tensor, v_new: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Helper function for FP8 load.
 
-    Unified layout will use a Triton fused kernel to gather+dequantize+apply-scale on-the-fly.
-    Distinct layout currently falls back to the Python dequant path.
+    Unified layout uses a Triton fused kernel to gather+dequantize+apply-scale on-the-fly.
+    Distinct layout also uses a fused kernel (no Python full-cache dequant fallback).
     
     Supports both unified and distinct layouts:
     - Unified: [num_blocks, page_size, num_kv_heads, head_dim]
@@ -762,34 +1042,64 @@ def _load_kvcache_fp8(k_cache: torch.Tensor, v_cache: torch.Tensor,
 
         return k_output, v_output
     else:
-        # Reference path (slow): full-cache dequantization in Python then BF16 gather.
-        # Kept for correctness and for distinct layout until a fused kernel is implemented.
-        # Distinct layout: k_cache [num_blks, h, hdim // x, blk_sz, x], v_cache [num_blks, h, hdim, blk_sz]
-        # For distinct layout, we need to handle the different shapes
-        # k_cache: [num_blks, h, hdim // x, blk_sz, x]
-        # v_cache: [num_blks, h, hdim, blk_sz]
-        N_BLOCKS, H_KV = k_cache.shape[0], k_cache.shape[1]
-        
-        # Dequantize cache: view uint8 storage as FP8 dtype, then dequantize
+        # Distinct layout: fused gather + dequant + scale in kernel.
         k_cache_fp8 = strategy.view_kv_cache_for_kernels(k_cache)
         v_cache_fp8 = strategy.view_kv_cache_for_kernels(v_cache)
-        
-        # Convert to float32 for dequantization
-        k_cache_fp32 = k_cache_fp8.float()
-        v_cache_fp32 = v_cache_fp8.float()
-        
-        # Apply scale: broadcast k_scale and v_scale to match cache shapes
-        # k_cache_fp32: [num_blks, h, hdim // x, blk_sz, x]
-        # v_cache_fp32: [num_blks, h, hdim, blk_sz]
-        # k_scale/v_scale: [num_kv_heads] -> [1, num_kv_heads, 1, 1, 1] for k, [1, num_kv_heads, 1, 1] for v
-        k_scale_broadcast = k_scale.view(1, -1, 1, 1, 1)  # [1, num_kv_heads, 1, 1, 1]
-        v_scale_broadcast = v_scale.view(1, -1, 1, 1)  # [1, num_kv_heads, 1, 1]
-        
-        k_cache_bf16 = (k_cache_fp32 * k_scale_broadcast).to(torch.bfloat16)
-        v_cache_bf16 = (v_cache_fp32 * v_scale_broadcast).to(torch.bfloat16)
-    
-    # Fallback: reuse BF16 gather logic with the dequantized cache
-    return _load_kvcache_bf16(k_cache_bf16, v_cache_bf16, attn_metadata, k_new, v_new)
+
+        NUM_SEQS, MAX_SEQ_BLOCKS = attn_metadata.block_tables.shape
+        ctxlens = attn_metadata.context_lens
+        seqlens = attn_metadata.seq_lens_ts
+        assert sum(seqlens) == k_new.shape[0]
+        DIFFUSION_BLOCK_SIZE = attn_metadata.seqs[0].diffusion_block_size
+        MAX_DIFFUSION_BLOCK_SIZE = max(seqlens)
+        assert MAX_DIFFUSION_BLOCK_SIZE % DIFFUSION_BLOCK_SIZE == 0
+
+        total_lens = ctxlens + seqlens
+        cu_seqlens_q = attn_metadata.cu_seqlens_q
+        cu_seqlens_k = attn_metadata.cu_seqlens_k
+        assert sum(total_lens) == cu_seqlens_k[-1]
+        assert cu_seqlens_q.shape == cu_seqlens_k.shape
+        assert cu_seqlens_q.shape[0] == NUM_SEQS + 1
+
+        # Distinct cache shapes:
+        # k_cache: [NBlks, Hkv, HEAD_DIM//x, PAGE_SIZE, x]
+        # v_cache: [NBlks, Hkv, HEAD_DIM, PAGE_SIZE]
+        PAGE_SIZE = int(k_cache.shape[3])
+        HEAD_DIM = int(v_cache.shape[2])
+        H_KV = int(v_cache.shape[1])
+        x = int(k_cache.shape[-1])
+
+        kv_output_shape = (sum(total_lens).item(), H_KV, HEAD_DIM)
+        k_output = torch.empty(kv_output_shape, device=k_cache.device, dtype=torch.bfloat16)
+        v_output = torch.empty_like(k_output)
+
+        GRID = (NUM_SEQS, MAX_SEQ_BLOCKS, H_KV)
+        load_kvcache_kernel_fp8_distinct[GRID](
+            k_cache_fp8, v_cache_fp8,
+            k_scale, v_scale,
+            k_new, v_new,
+            attn_metadata.block_tables,
+            k_output, v_output,
+            seqlens, ctxlens,
+            cu_seqlens_q, cu_seqlens_k,
+            *k_cache_fp8.stride(),
+            *v_cache_fp8.stride(),
+            *k_new.stride(),
+            *attn_metadata.block_tables.stride(),
+            *k_output.stride(),
+            ctxlens.stride(0),
+            seqlens.stride(0),
+            cu_seqlens_q.stride(0),
+            cu_seqlens_k.stride(0),
+            LAST_BLK_ID=attn_metadata.block_tables.shape[-1] - 1,
+            HEAD_DIM=HEAD_DIM,
+            PAGE_SIZE=PAGE_SIZE,
+            DIFFUSION_BLOCK_SIZE=DIFFUSION_BLOCK_SIZE,
+            KV_LOAD_UNROLL_FACTOR=2,
+            X=x,
+        )
+
+        return k_output, v_output
 
 
 def load_kvcache(k_cache: torch.Tensor, v_cache: torch.Tensor,

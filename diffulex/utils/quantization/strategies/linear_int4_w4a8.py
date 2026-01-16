@@ -19,23 +19,86 @@ import warnings
 import torch
 import torch.nn.functional as F
 
+from diffulex.attention.metadata import is_warming_up
 from diffulex.utils.quantization.registry import register_linear_strategy
 from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
 
 try:
-    from diffulex_kernel.python.linear_kernels import w4a8_gemm, w4a8_scaled_gemm
+    from diffulex_kernel.python.linear_kernels import (
+        w4a8_gemm,
+        w4a8_scaled_gemm,
+        w4a8_fused_act_gemm,
+        w8a8_act_quant,
+    )
     _TILELANG_AVAILABLE = True
 except ImportError:
     _TILELANG_AVAILABLE = False
     w4a8_gemm = None
     w4a8_scaled_gemm = None
+    w8a8_act_quant = None
+    w4a8_fused_act_gemm = None
+
+try:
+    # Optional: only needed for TileLang autotune warmup.
+    from tilelang.autotuner import set_autotune_inputs  # type: ignore
+except Exception:
+    set_autotune_inputs = None
 
 
-def _quantize_per_row_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+_DEFAULT_TL_LINEAR_CFG: dict[str, Any] = {
+    "block_M": 64,
+    "block_N": 64,
+    "block_K": 128,
+    "num_stages": 2,
+    "threads": 128,
+}
+
+
+def _quantize_per_row_int8_torch(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     abs_max = x.abs().amax(dim=-1, keepdim=False)  # [M]
     scales = (abs_max.clamp(min=1e-8) / 127.0).to(torch.float32)  # [M]
     x_q = torch.round(x.to(torch.float32) / scales.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
     return x_q, scales
+
+
+def _quantize_per_row_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row symmetric int8 quantization with optional TileLang fused kernel.
+
+    Default: use TileLang fused kernel if available, otherwise fall back to torch ops.
+
+    Env:
+        - DIFFULEX_W4A8_USE_TL_ACT_QUANT=0 to force torch fallback.
+    """
+    use_tl = os.getenv("DIFFULEX_W4A8_USE_TL_ACT_QUANT", "1") == "1"
+    if (
+        use_tl
+        and _TILELANG_AVAILABLE
+        and (w8a8_act_quant is not None)
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.dim() == 2
+    ):
+        m, k = x.shape
+        if m <= 16:
+            block_m = 16
+        elif m <= 32:
+            block_m = 32
+        else:
+            block_m = 64
+        try:
+            kernel = w8a8_act_quant(
+                m,
+                k,
+                block_M=block_m,
+                block_K=256,
+                threads=128,
+            )
+            x_q, scales = kernel(x)
+            return x_q, scales
+        except Exception:
+            pass
+    return _quantize_per_row_int8_torch(x)
 
 
 def _int8_mm(a_int8: torch.Tensor, b_int8: torch.Tensor) -> torch.Tensor:
@@ -94,6 +157,8 @@ class LinearInt4W4A8Strategy(LinearQuantizationStrategy):
         # (packed_id, K) -> unpacked_t_int8[K,N]
         self._unpacked_t_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._dequant_weight_cache: dict[int, torch.Tensor] = {}
+        # (device_index, M_bucket, N, K) -> TileLang config dict for fused kernel
+        self._tl_fused_cfg_cache: dict[tuple[int, int, int, int], dict[str, Any]] = {}
 
     @property
     def name(self) -> str:
@@ -127,6 +192,7 @@ class LinearInt4W4A8Strategy(LinearQuantizationStrategy):
         self._unpacked_cache.clear()
         self._unpacked_t_cache.clear()
         self._dequant_weight_cache.clear()
+        self._tl_fused_cfg_cache.clear()
 
     def quantize(self, tensor: torch.Tensor, **kwargs) -> tuple[torch.Tensor, Any]:
         _ = kwargs
@@ -225,7 +291,97 @@ class LinearInt4W4A8Strategy(LinearQuantizationStrategy):
         # Quantize activation per-row to int8
         if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
             x = x.to(torch.bfloat16)
-        x_q, x_scales = _quantize_per_row_int8(x)
+        if x.dtype != torch.bfloat16:
+            x = x.to(torch.bfloat16)
+
+        # Try TileLang fused quant + GEMM first (bf16 activation input).
+        use_fused = os.getenv("DIFFULEX_W4A8_USE_TL_FUSED_GEMM", "1") == "1"
+        if (
+            use_fused
+            and _TILELANG_AVAILABLE
+            and (w4a8_fused_act_gemm is not None)
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and x.dim() == 2
+            and x.is_contiguous()
+        ):
+            try:
+                M, K = x.shape
+                N, packed_K = packed.shape
+                expected_packed_K = (original_in_features + 1) // 2
+                assert packed_K == expected_packed_K, (
+                    f"Packed K mismatch: got {packed_K}, expected {expected_packed_K} for K={original_in_features}"
+                )
+
+                # Reduce TileLang JIT compilation churn using M-bucketing (similar to W8A16)
+                M_bucket = M
+                if M > 1:
+                    if M <= 64:
+                        M_bucket = 1 << (M - 1).bit_length()
+                    else:
+                        M_bucket = ((M + 63) // 64) * 64
+
+                x_for_kernel = x
+                if M_bucket != M:
+                    x_pad = torch.zeros((M_bucket, K), device=x.device, dtype=torch.bfloat16)
+                    x_pad[:M, :] = x
+                    x_for_kernel = x_pad
+
+                dev_idx = x.device.index or 0
+                cfg_key = (dev_idx, M_bucket, N, original_in_features)
+                cfg = self._tl_fused_cfg_cache.get(cfg_key)
+                kernel = None
+
+                # TileLang autotune (warmup-only): we set real inputs so the autotuner can benchmark configs.
+                if cfg is None and is_warming_up() and set_autotune_inputs is not None:
+                    try:
+                        with set_autotune_inputs([x_for_kernel, packed, w_scales]):
+                            kernel = w4a8_fused_act_gemm(M_bucket, N, original_in_features)
+                        cfg = kernel.config
+                        self._tl_fused_cfg_cache[cfg_key] = cfg
+                    except Exception:
+                        # Cache a safe default to avoid retriggering autotune for this key.
+                        cfg = _DEFAULT_TL_LINEAR_CFG
+                        self._tl_fused_cfg_cache[cfg_key] = cfg
+
+                if cfg is None:
+                    cfg = _DEFAULT_TL_LINEAR_CFG
+                    self._tl_fused_cfg_cache[cfg_key] = cfg
+
+                if kernel is None:
+                    kernel = w4a8_fused_act_gemm(M_bucket, N, original_in_features, **cfg)
+                out_full = kernel(x_for_kernel, packed, w_scales)
+                out = out_full[:M, :] if M_bucket != M else out_full
+                if bias is not None:
+                    out = out + bias
+                return out
+            except Exception as e:
+                error_msg = str(e)
+                if len(error_msg) > 200:
+                    error_msg = error_msg[:200] + "..."
+                warnings.warn(
+                    f"W4A8 fused quant GEMM failed, falling back to quantize+GEMM: {error_msg}",
+                    UserWarning,
+                )
+
+        # Step-local cache for activation quantization (reuse within one step for QKV/gate-up, etc.)
+        use_cache = os.getenv("DIFFULEX_W4A8_ACT_QUANT_CACHE", "1") == "1"
+        cached = None
+        if use_cache:
+            try:
+                from diffulex.utils.quantization.context import get_cached_act_quant, set_cached_act_quant
+                cached = get_cached_act_quant(x)
+            except Exception:
+                cached = None
+        if cached is not None:
+            x_q, x_scales = cached
+        else:
+            x_q, x_scales = _quantize_per_row_int8(x)
+            if use_cache:
+                try:
+                    set_cached_act_quant(x, x_q, x_scales)
+                except Exception:
+                    pass
         if x_q.device != x.device:
             x_q = x_q.to(device=x.device)
             x_scales = x_scales.to(device=x.device)
@@ -302,7 +458,6 @@ class LinearInt4W4A8Strategy(LinearQuantizationStrategy):
                     return out
             except Exception as e:
                 # Fallback to _int8_mm on any kernel error
-                import warnings
                 error_msg = str(e)
                 if len(error_msg) > 200:
                     error_msg = error_msg[:200] + "..."

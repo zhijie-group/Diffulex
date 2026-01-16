@@ -1,0 +1,47 @@
+# BF16 + FP8 KV Cache (distinct layout)
+engine:
+  model_path: "/data1/ckpts/Dream-org/Dream-v0-Base-7B"
+  tokenizer_path: null
+  model_name: "dream"
+  decoding_strategy: "d2f"
+  mask_token_id: 151666
+  
+  use_lora: false
+  lora_path: ""
+  
+  tensor_parallel_size: 1
+  data_parallel_size: 1
+  
+  gpu_memory_utilization: 0.7
+  max_model_len: 2048
+  max_num_batched_tokens: 4096
+  max_num_seqs: 128
+  
+  enforce_eager: true  # CUDA graph not implemented yet for DiffusionLM
+  kv_cache_layout: "distinct"  # Test distinct layout
+  
+  accept_threshold: 0.9
+  complete_threshold: 0.95
+  add_new_block_threshold: 0.1
+  diffusion_block_size: 32
+  
+  # Quantization: BF16 weights + FP8 KV cache
+  kv_cache_dtype: "fp8_e4m3"
+  decode_mode: "static"
+  linear_attn_weight_dtype: "bf16"
+  linear_mlp_weight_dtype: "bf16"
+  linear_attn_act_dtype: "bf16"
+  linear_mlp_act_dtype: "bf16"
+
+eval:
+  dataset_name: "gsm8k"
+  dataset_split: "test"
+  dataset_limit: 10  # 10 samples for testing
+  
+  temperature: 0.0
+  max_tokens: 512
+  ignore_eos: false
+  
+  output_dir: "benchmark_results_distinct/bf16_fp8kv"
+  save_results: true
+  use_tqdm: true

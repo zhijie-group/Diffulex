@@ -42,6 +42,15 @@ try:
 except ImportError:
     pass
 
+try:
+    from diffulex.attention.metadata import is_warming_up
+    from tilelang.autotuner import set_autotune_inputs
+    _AUTOTUNE_AVAILABLE = True
+except ImportError:
+    _AUTOTUNE_AVAILABLE = False
+    is_warming_up = lambda: False
+    set_autotune_inputs = lambda *args, **kwargs: lambda f: f
+
 
 def _quantize_per_row_fp8(
     x: torch.Tensor,
@@ -116,6 +125,8 @@ class LinearFP8W8A8Strategy(LinearQuantizationStrategy):
         self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # Optional cache: weight_id -> bf16 dequantized weight (speed-first; uses extra memory)
         self._dequant_weight_cache: dict[int, torch.Tensor] = {}
+        # TileLang autotune config cache: (device, M_bucket, N, K) -> config dict
+        self._tl_autotune_config_cache: dict[tuple[str, int, int, int], dict] = {}
     
     @property
     def name(self) -> str:
@@ -368,8 +379,35 @@ class LinearFP8W8A8Strategy(LinearQuantizationStrategy):
                     x_scales_pad[:M] = x_scales
                     x_scales = x_scales_pad
 
-                # Compile kernel (cached by TileLang)
-                kernel = fp8_w8a8_gemm(M_bucket, N, K, block_M=64, block_N=64, block_K=128, num_stages=2, threads=128)
+                # TileLang autotune: use warmup + config cache pattern
+                cache_key = (str(x.device), M_bucket, N, K)
+                config = self._tl_autotune_config_cache.get(cache_key)
+                
+                if _AUTOTUNE_AVAILABLE and is_warming_up() and config is None:
+                    # Warmup phase: run autotune with real inputs
+                    try:
+                        assert self.act_spec.fp8_view_dtype is not None
+                        assert self.weight_spec.fp8_view_dtype is not None
+                        x_fp8 = x_q_for_kernel.view(self.act_spec.fp8_view_dtype)
+                        w_fp8 = qweight.view(self.weight_spec.fp8_view_dtype)
+                        with set_autotune_inputs([x_fp8, w_fp8, x_scales, w_scales]):
+                            kernel = fp8_w8a8_gemm(M_bucket, N, K)
+                        config = kernel.config
+                        self._tl_autotune_config_cache[cache_key] = config
+                    except Exception:
+                        # Fallback to default config if autotune fails
+                        config = None
+                
+                # Use cached config or default parameters
+                assert self.act_spec.fp8_view_dtype is not None
+                assert self.weight_spec.fp8_view_dtype is not None
+                x_fp8 = x_q_for_kernel.view(self.act_spec.fp8_view_dtype)
+                w_fp8 = qweight.view(self.weight_spec.fp8_view_dtype)
+                if config is not None:
+                    kernel = fp8_w8a8_gemm(M_bucket, N, K, **config)
+                else:
+                    # Default config (backward compatible)
+                    kernel = fp8_w8a8_gemm(M_bucket, N, K, block_M=64, block_N=64, block_K=128, num_stages=2, threads=128)
                 
                 # Call kernel - out_idx=[4] means output is the 5th parameter
                 # Inputs: A/B are fp8 tensors (viewed from uint8 storage), scales are float32/float16.

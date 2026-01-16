@@ -19,19 +19,42 @@ import warnings
 import torch
 import torch.nn.functional as F
 
+from diffulex.attention.metadata import is_warming_up
 from diffulex.utils.quantization.registry import register_linear_strategy
 from diffulex.utils.quantization.strategy import LinearQuantizationStrategy
 
 try:
-    from diffulex_kernel.python.linear_kernels import w8a8_gemm, w8a8_scaled_gemm
+    from diffulex_kernel.python.linear_kernels import (
+        w8a8_gemm,
+        w8a8_scaled_gemm,
+        w8a8_act_quant,
+        w8a8_fused_act_gemm,
+    )
     _TILELANG_AVAILABLE = True
 except ImportError:
     _TILELANG_AVAILABLE = False
     w8a8_gemm = None
     w8a8_scaled_gemm = None
+    w8a8_act_quant = None
+    w8a8_fused_act_gemm = None
+
+try:
+    # Optional: only needed for TileLang autotune warmup.
+    from tilelang.autotuner import set_autotune_inputs  # type: ignore
+except Exception:
+    set_autotune_inputs = None
 
 
-def _quantize_per_row_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+_DEFAULT_TL_LINEAR_CFG: dict[str, Any] = {
+    "block_M": 64,
+    "block_N": 64,
+    "block_K": 128,
+    "num_stages": 2,
+    "threads": 128,
+}
+
+
+def _quantize_per_row_int8_torch(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row symmetric int8 quantization.
 
     Returns:
@@ -43,6 +66,48 @@ def _quantize_per_row_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     scales = (abs_max.clamp(min=1e-8) / 127.0).to(torch.float32)  # [M]
     x_q = torch.round(x.to(torch.float32) / scales.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
     return x_q, scales
+
+
+def _quantize_per_row_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-row symmetric int8 quantization with optional TileLang fused kernel.
+
+    Default: use TileLang fused kernel if available, otherwise fall back to torch ops.
+
+    Env:
+        - DIFFULEX_W8A8_USE_TL_ACT_QUANT=0 to force torch fallback.
+    """
+    use_tl = os.getenv("DIFFULEX_W8A8_USE_TL_ACT_QUANT", "1") == "1"
+    if (
+        use_tl
+        and _TILELANG_AVAILABLE
+        and (w8a8_act_quant is not None)
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and x.dim() == 2
+    ):
+        m, k = x.shape
+        # Choose a small set of block_M values to reduce wasted work on decode small-M.
+        if m <= 16:
+            block_m = 16
+        elif m <= 32:
+            block_m = 32
+        else:
+            block_m = 64
+        try:
+            kernel = w8a8_act_quant(
+                m,
+                k,
+                block_M=block_m,
+                block_K=256,
+                threads=128,
+            )
+            x_q, scales = kernel(x)
+            return x_q, scales
+        except Exception:
+            # Fall back silently to torch path for robustness (e.g., unsupported arch/toolchain).
+            pass
+    return _quantize_per_row_int8_torch(x)
 
 
 def _int8_mm(a_int8: torch.Tensor, b_int8: torch.Tensor) -> torch.Tensor:
@@ -73,6 +138,8 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
         self._weight_t_cache: dict[int, torch.Tensor] = {}
         # speed-first option (uses extra memory)
         self._dequant_weight_cache: dict[int, torch.Tensor] = {}
+        # (device_index, M_bucket, N, K) -> TileLang config dict for fused kernel
+        self._tl_fused_cfg_cache: dict[tuple[int, int, int, int], dict[str, Any]] = {}
 
     @property
     def name(self) -> str:
@@ -104,6 +171,7 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
         self._weight_cache.clear()
         self._weight_t_cache.clear()
         self._dequant_weight_cache.clear()
+        self._tl_fused_cfg_cache.clear()
 
     def quantize(self, tensor: torch.Tensor, **kwargs) -> tuple[torch.Tensor, Any]:
         _ = kwargs
@@ -188,7 +256,102 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
         # Quantize activation per-row
         if x.dtype not in (torch.bfloat16, torch.float16, torch.float32):
             x = x.to(torch.bfloat16)
-        x_q, x_scales = _quantize_per_row_int8(x)
+        if x.dtype != torch.bfloat16:
+            x = x.to(torch.bfloat16)
+
+        # Try TileLang fused quant + GEMM first (bf16 activation input).
+        use_fused = os.getenv("DIFFULEX_W8A8_USE_TL_FUSED_GEMM", "1") == "1"
+        if (
+            use_fused
+            and _TILELANG_AVAILABLE
+            and (w8a8_fused_act_gemm is not None)
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and x.dim() == 2
+            and x.is_contiguous()
+        ):
+            try:
+                M, K = x.shape
+                N, K_w = qweight.shape
+                assert K == K_w, f"K dimension mismatch: {K} != {K_w}"
+
+                # Reduce TileLang JIT compilation churn using M-bucketing (similar to W8A16)
+                M_bucket = M
+                if M > 1:
+                    if M <= 64:
+                        M_bucket = 1 << (M - 1).bit_length()
+                    else:
+                        M_bucket = ((M + 63) // 64) * 64
+
+                x_for_kernel = x
+                if M_bucket != M:
+                    x_pad = torch.zeros((M_bucket, K), device=x.device, dtype=torch.bfloat16)
+                    x_pad[:M, :] = x
+                    x_for_kernel = x_pad
+
+                dev_idx = x.device.index or 0
+                cfg_key = (dev_idx, M_bucket, N, K)
+                cfg = self._tl_fused_cfg_cache.get(cfg_key)
+                kernel = None
+
+                # Only run autotune during warmup when autotuner inputs are available.
+                if cfg is None and is_warming_up() and set_autotune_inputs is not None:
+                    try:
+                        with set_autotune_inputs([x_for_kernel, qweight, w_scales]):
+                            kernel = w8a8_fused_act_gemm(M_bucket, N, K)
+                        # Only cache config if autotune succeeded (kernel has valid config)
+                        if hasattr(kernel, 'config') and kernel.config is not None:
+                            cfg = kernel.config
+                            self._tl_fused_cfg_cache[cfg_key] = cfg
+                    except Exception as autotune_err:
+                        # Autotune failed (e.g., all configs failed to compile), use default
+                        autotune_msg = str(autotune_err)
+                        if len(autotune_msg) > 150:
+                            autotune_msg = autotune_msg[:150] + "..."
+                        warnings.warn(
+                            f"W8A8 fused autotune failed ({autotune_msg}), using default config",
+                            UserWarning,
+                        )
+                        kernel = None
+
+                # Non-warmup path: keep deterministic behavior with a default config.
+                if cfg is None:
+                    cfg = _DEFAULT_TL_LINEAR_CFG
+
+                if kernel is None:
+                    kernel = w8a8_fused_act_gemm(M_bucket, N, K, **cfg)
+                out_full = kernel(x_for_kernel, qweight, w_scales)
+                out = out_full[:M, :] if M_bucket != M else out_full
+                if bias is not None:
+                    out = out + bias
+                return out
+            except Exception as e:
+                error_msg = str(e)
+                if len(error_msg) > 200:
+                    error_msg = error_msg[:200] + "..."
+                warnings.warn(
+                    f"W8A8 fused quant GEMM failed, falling back to quantize+GEMM: {error_msg}",
+                    UserWarning,
+                )
+
+        # Step-local cache for activation quantization (reuse within one step for QKV/gate-up, etc.)
+        use_cache = os.getenv("DIFFULEX_W8A8_ACT_QUANT_CACHE", "1") == "1"
+        cached = None
+        if use_cache:
+            try:
+                from diffulex.utils.quantization.context import get_cached_act_quant, set_cached_act_quant
+                cached = get_cached_act_quant(x)
+            except Exception:
+                cached = None
+        if cached is not None:
+            x_q, x_scales = cached
+        else:
+            x_q, x_scales = _quantize_per_row_int8(x)
+            if use_cache:
+                try:
+                    set_cached_act_quant(x, x_q, x_scales)
+                except Exception:
+                    pass
         if x_q.device != x.device:
             x_q = x_q.to(device=x.device)
             x_scales = x_scales.to(device=x.device)
@@ -206,12 +369,6 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
                     # Fall through to _int8_mm fallback
                     pass
                 else:
-                    # Prepare weight transpose for int8 GEMM: [N,K] -> [K,N]
-                    wt = self._weight_t_cache.get(weight_id)
-                    if wt is None or wt.device != x.device:
-                        wt = qweight.t().contiguous()
-                        self._weight_t_cache[weight_id] = wt
-
                     # Reduce TileLang JIT compilation churn using M-bucketing (similar to W8A16)
                     M_bucket = M
                     if M > 1:
@@ -243,7 +400,7 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
                             num_stages=2,
                             threads=128,
                         )
-                        out_full = kernel(x_q_for_kernel, wt, x_scales_for_kernel, w_scales)
+                        out_full = kernel(x_q_for_kernel, qweight, x_scales_for_kernel, w_scales)
                         out = out_full[:M, :] if M_bucket != M else out_full
                     else:
                         # Fallback to int32-output kernel + python scaling
@@ -257,7 +414,7 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
                             num_stages=2,
                             threads=128,
                         )
-                        out_i32_full = kernel(x_q_for_kernel, wt)
+                        out_i32_full = kernel(x_q_for_kernel, qweight)
                         out_i32 = out_i32_full[:M, :] if M_bucket != M else out_i32_full
 
                         out_fp32 = out_i32.to(torch.float32)

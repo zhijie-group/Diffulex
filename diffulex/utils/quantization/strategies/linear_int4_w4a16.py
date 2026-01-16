@@ -27,6 +27,15 @@ except ImportError:
     _TILELANG_AVAILABLE = False
     w4a16_gemm = None
 
+try:
+    from diffulex.attention.metadata import is_warming_up
+    from tilelang.autotuner import set_autotune_inputs
+    _AUTOTUNE_AVAILABLE = True
+except ImportError:
+    _AUTOTUNE_AVAILABLE = False
+    is_warming_up = lambda: False
+    set_autotune_inputs = lambda *args, **kwargs: lambda f: f
+
 
 @register_linear_strategy(weight_dtype="int4", act_dtype="bf16")
 def _build_linear_int4_w4a16() -> LinearQuantizationStrategy:
@@ -55,6 +64,8 @@ class LinearInt4W4A16Strategy(LinearQuantizationStrategy):
         self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # Optional cache: weight_id -> bf16 dequantized weight (speed-first; uses extra memory)
         self._dequant_weight_cache: dict[int, torch.Tensor] = {}
+        # TileLang autotune config cache: (device, M_bucket, N, K) -> config dict
+        self._tl_autotune_config_cache: dict[tuple[str, int, int, int], dict] = {}
 
     @property
     def name(self) -> str:
@@ -406,10 +417,27 @@ class LinearInt4W4A16Strategy(LinearQuantizationStrategy):
                     x_pad[:M, :] = x
                     x_for_kernel = x_pad
 
-                # Compile kernel (cached by TileLang) for the bucketed M.
-                # Note: keep a single tiling config to avoid exploding the number of compiled kernels
-                # (N/K vary by layer; adding more block_M variants can introduce mid-run compilations).
-                kernel = w4a16_gemm(M_bucket, N, K, block_M=64, block_N=64, block_K=128, num_stages=2, threads=128)
+                # TileLang autotune: use warmup + config cache pattern
+                cache_key = (str(x.device), M_bucket, N, K)
+                config = self._tl_autotune_config_cache.get(cache_key)
+                
+                if _AUTOTUNE_AVAILABLE and is_warming_up() and config is None:
+                    # Warmup phase: run autotune with real inputs
+                    try:
+                        with set_autotune_inputs([x_for_kernel, packed_weight, scales]):
+                            kernel = w4a16_gemm(M_bucket, N, K)
+                        config = kernel.config
+                        self._tl_autotune_config_cache[cache_key] = config
+                    except Exception:
+                        # Fallback to default config if autotune fails
+                        config = None
+                
+                # Use cached config or default parameters
+                if config is not None:
+                    kernel = w4a16_gemm(M_bucket, N, K, **config)
+                else:
+                    # Default config (backward compatible)
+                    kernel = w4a16_gemm(M_bucket, N, K, block_M=64, block_N=64, block_K=128, num_stages=2, threads=128)
                 
                 # Call kernel - out_idx=[3] means output is the 4th parameter,
                 # so we only pass inputs (x, packed_weight, scales), and kernel returns output

@@ -78,6 +78,9 @@ class DiffulexProfiler:
             try:
                 from diffulex_profiler.backends import PyTorchProfilerBackend
                 pytorch_config = self.config.pytorch_profiler_config or {}
+                # Keep output dir consistent across backends.
+                if "output_dir" not in pytorch_config:
+                    pytorch_config["output_dir"] = self.config.output_dir
                 self.backend = PyTorchProfilerBackend(**pytorch_config)
             except ImportError:
                 logger.warning("PyTorch Profiler not available, falling back to simple timer")

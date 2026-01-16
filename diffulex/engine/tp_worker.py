@@ -67,6 +67,13 @@ class DiffulexTPWorker:
         return seq.seq_id
 
     def step(self):
+        # Clear step-local activation quant cache (W8A8/W4A8, etc.) so we only reuse within a single step.
+        try:
+            from diffulex.utils.quantization.context import clear_act_quant_cache
+            clear_act_quant_cache()
+        except Exception:
+            # Quantization context may not be initialized in some paths; ignore.
+            pass
         seqs, is_prefill = self.scheduler.schedule()
         sample_output = self.model_runner.call("run", seqs, is_prefill)
         n_diff_steps = self.scheduler.postprocess(seqs, sample_output)

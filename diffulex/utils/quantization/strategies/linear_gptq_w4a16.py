@@ -26,6 +26,15 @@ try:
 except ImportError:
     gptq_w4a16_gemm = None
 
+try:
+    from diffulex.attention.metadata import is_warming_up
+    from tilelang.autotuner import set_autotune_inputs
+    _AUTOTUNE_AVAILABLE = True
+except ImportError:
+    _AUTOTUNE_AVAILABLE = False
+    is_warming_up = lambda: False
+    set_autotune_inputs = lambda *args, **kwargs: lambda f: f
+
 
 def _unpack_gptq_int4(
     packed: torch.Tensor,
@@ -201,6 +210,8 @@ class LinearGPTQW4A16Strategy(LinearQuantizationStrategy):
     def __init__(self):
         """Initialize strategy (no cache needed when using kernel)."""
         super().__init__()
+        # TileLang autotune config cache: (device, M_bucket, N, K, num_groups, group_size) -> config dict
+        self._tl_autotune_config_cache: dict[tuple[str, int, int, int, int, int], dict] = {}
 
     @property
     def name(self) -> str:
@@ -410,8 +421,27 @@ class LinearGPTQW4A16Strategy(LinearQuantizationStrategy):
                         x_pad[:M, :] = x
                         x_for_kernel = x_pad
 
-                    # Compile kernel (cached by TileLang)
-                    kernel = gptq_w4a16_gemm(M_bucket, N, K, num_groups, group_size, block_M=64, block_N=64, block_K=128, num_stages=2, threads=128)
+                    # TileLang autotune: use warmup + config cache pattern
+                    cache_key = (str(x.device), M_bucket, N, K, num_groups, group_size)
+                    config = self._tl_autotune_config_cache.get(cache_key)
+                    
+                    if _AUTOTUNE_AVAILABLE and is_warming_up() and config is None:
+                        # Warmup phase: run autotune with real inputs
+                        try:
+                            with set_autotune_inputs([x_for_kernel, qweight, qzeros, scales, g_idx]):
+                                kernel = gptq_w4a16_gemm(M_bucket, N, K, num_groups, group_size)
+                            config = kernel.config
+                            self._tl_autotune_config_cache[cache_key] = config
+                        except Exception:
+                            # Fallback to default config if autotune fails
+                            config = None
+                    
+                    # Use cached config or default parameters
+                    if config is not None:
+                        kernel = gptq_w4a16_gemm(M_bucket, N, K, num_groups, group_size, **config)
+                    else:
+                        # Default config (backward compatible)
+                        kernel = gptq_w4a16_gemm(M_bucket, N, K, num_groups, group_size, block_M=64, block_N=64, block_K=128, num_stages=2, threads=128)
 
                     # Call kernel - out_idx=[5] means output is the 6th parameter
                     output_full = kernel(x_for_kernel, qweight, qzeros, scales, g_idx)

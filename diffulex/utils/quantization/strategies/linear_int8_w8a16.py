@@ -31,6 +31,15 @@ try:
 except ImportError:
     w8a16_gemm_bias = None
 
+try:
+    from diffulex.attention.metadata import is_warming_up
+    from tilelang.autotuner import set_autotune_inputs
+    _AUTOTUNE_AVAILABLE = True
+except ImportError:
+    _AUTOTUNE_AVAILABLE = False
+    is_warming_up = lambda: False
+    set_autotune_inputs = lambda *args, **kwargs: lambda f: f
+
 
 @register_linear_strategy(weight_dtype="int8", act_dtype="bf16")
 def _build_linear_int8_w8a16() -> LinearQuantizationStrategy:
@@ -58,6 +67,8 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
         self._dequant_weight_cache: dict[int, torch.Tensor] = {}
         # bias cache for fused-bias kernel (store fp16 copy on device)
         self._bias_f16_cache: dict[int, torch.Tensor] = {}
+        # TileLang autotune config cache: (device, M_bucket, N, K) -> config dict
+        self._tl_autotune_config_cache: dict[tuple[str, int, int, int], dict] = {}
         # Lightweight runtime observability (opt-in by env var)
         self._rt_call_count: int = 0
         self._rt_fallback_count: int = 0
@@ -347,38 +358,73 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                 else:
                     block_m = 64
 
-                # Compile kernel (cached by TileLang) for the bucketed M.
-                # Note: keep a single tiling config to avoid exploding the number of compiled kernels
-                # (N/K vary by layer; adding more block_M variants can introduce mid-run compilations).
+                # TileLang autotune: use warmup + config cache pattern
                 # NOTE: fused-bias kernel currently regresses decode throughput significantly on typical workloads.
                 # Keep it disabled by default; can be enabled for experimentation.
                 fuse_bias = os.getenv("DIFFULEX_W8A16_FUSE_BIAS", "0") == "1"
                 use_bias_kernel = fuse_bias and (bias is not None) and (w8a16_gemm_bias is not None)
-                if use_bias_kernel:
-                    kernel = w8a16_gemm_bias(
-                        M_bucket,
-                        N,
-                        K,
-                        block_M=block_m,
-                        block_N=64,
-                        block_K=128,
-                        num_stages=2,
-                        threads=128,
-                    )
+                
+                cache_key = (str(x.device), M_bucket, N, K)
+                config = self._tl_autotune_config_cache.get(cache_key)
+                
+                if _AUTOTUNE_AVAILABLE and is_warming_up() and config is None:
+                    # Warmup phase: run autotune with real inputs
+                    try:
+                        if use_bias_kernel:
+                            b_key = id(bias)
+                            b = self._bias_f16_cache.get(b_key)
+                            if b is None or b.device != x.device:
+                                b = bias.to(device=x.device, dtype=torch.float16)
+                                self._bias_f16_cache[b_key] = b
+                            with set_autotune_inputs([x_for_kernel, quantized_weight, scales, b]):
+                                kernel = w8a16_gemm_bias(M_bucket, N, K)
+                        else:
+                            with set_autotune_inputs([x_for_kernel, quantized_weight, scales]):
+                                kernel = w8a16_gemm(M_bucket, N, K)
+                        config = kernel.config
+                        self._tl_autotune_config_cache[cache_key] = config
+                    except Exception:
+                        # Fallback to default config if autotune fails
+                        config = None
+                
+                # Use cached config or default parameters
+                if config is not None:
+                    if use_bias_kernel:
+                        kernel = w8a16_gemm_bias(M_bucket, N, K, **config)
+                    else:
+                        kernel = w8a16_gemm(M_bucket, N, K, **config)
                 else:
-                    kernel = w8a16_gemm(
-                        M_bucket,
-                        N,
-                        K,
-                        block_M=block_m,
-                        block_N=64,
-                        block_K=128,
-                        num_stages=2,
-                        threads=128,
-                    )
+                    # Default config (backward compatible)
+                    if use_bias_kernel:
+                        kernel = w8a16_gemm_bias(
+                            M_bucket,
+                            N,
+                            K,
+                            block_M=block_m,
+                            block_N=64,
+                            block_K=128,
+                            num_stages=2,
+                            threads=128,
+                        )
+                    else:
+                        kernel = w8a16_gemm(
+                            M_bucket,
+                            N,
+                            K,
+                            block_M=block_m,
+                            block_N=64,
+                            block_K=128,
+                            num_stages=2,
+                            threads=128,
+                        )
                 
                 # Call kernel - out_idx=[3] means output is the 4th parameter,
                 # so we only pass inputs (x, quantized_weight, scales), and kernel returns output
+                tag_kernel = os.getenv("DIFFULEX_PROFILE_TAG_W8A16", "0") == "1"
+                tag_name = (
+                    f"{'w8a16_gemm_bias' if use_bias_kernel else 'w8a16_gemm'}"
+                    f"[M={M} Mb={M_bucket} N={N} K={K} bm={block_m} bn=64 bk=128 st=2 th=128]"
+                )
                 if use_bias_kernel:
                     # out_idx=[4] -> output is 5th arg (returned). Inputs: A, B, Scales, Bias
                     # NOTE: kernel expects fp16 bias (see kernel signature).
@@ -387,9 +433,17 @@ class LinearInt8W8A16Strategy(LinearQuantizationStrategy):
                     if b is None or b.device != x.device:
                         b = bias.to(device=x.device, dtype=torch.float16)
                         self._bias_f16_cache[b_key] = b
-                    output_full = kernel(x_for_kernel, quantized_weight, scales, b)
+                    if tag_kernel:
+                        with torch.profiler.record_function(tag_name):
+                            output_full = kernel(x_for_kernel, quantized_weight, scales, b)
+                    else:
+                        output_full = kernel(x_for_kernel, quantized_weight, scales, b)
                 else:
-                    output_full = kernel(x_for_kernel, quantized_weight, scales)
+                    if tag_kernel:
+                        with torch.profiler.record_function(tag_name):
+                            output_full = kernel(x_for_kernel, quantized_weight, scales)
+                    else:
+                        output_full = kernel(x_for_kernel, quantized_weight, scales)
                 output = output_full[:M, :] if M_bucket != M else output_full
                 
                 # Add bias if present

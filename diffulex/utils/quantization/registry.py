@@ -86,11 +86,15 @@ def _normalize_linear_dtype(dtype: str) -> str:
         "gptq": "gptq",
         "awq": "awq",
         "gptq_awq": "gptq_awq",
+        # vLLM-style fused W8A16 path (Diffulex vendored): user-facing alias "marlin"
+        # Normalized key is "marlin_int8" to avoid conflating with other quant methods.
+        "marlin": "marlin_int8",
+        "marlin_int8": "marlin_int8",
     }
     if s not in aliases:
         raise ValueError(
             f"Unsupported linear quant dtype={dtype!r}. "
-            "Supported: bf16/int8/int4/fp8/fp8_e4m3/fp8_e5m2/gptq/awq"
+            "Supported: bf16/int8/int4/fp8/fp8_e4m3/fp8_e5m2/gptq/awq/marlin"
         )
     return aliases[s]
 
@@ -146,6 +150,6 @@ def create_linear_strategy(*, weight_dtype: str, act_dtype: str) -> LinearQuanti
 def registered_linear_dtypes() -> list[str]:
     """Return the normalized dtype/method names accepted by `_normalize_linear_dtype`."""
     # Keep this list stable for CLI/help messages.
-    return ["bf16", "int8", "int4", "fp8_e4m3", "fp8_e5m2", "gptq", "awq", "gptq_awq"]
+    return ["bf16", "int8", "int4", "fp8_e4m3", "fp8_e5m2", "gptq", "awq", "gptq_awq", "marlin_int8"]
 
 
