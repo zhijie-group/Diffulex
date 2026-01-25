@@ -108,12 +108,10 @@ class LinearFP8W8A16Strategy(LinearQuantizationStrategy):
         bias: Optional[torch.Tensor],
         *,
         quant_kind: str,
-        **kwargs: Any,
+        quant_scales: Optional[torch.Tensor] = None,
+        out_features: Optional[int] = None,
     ) -> torch.Tensor:
-        _ = quant_kind
-        from vllm.platforms import current_platform  # type: ignore
-
-        quant_scales = kwargs.get("quant_scales", None)
+        _ = quant_kind, out_features
         if weight is not None and quant_scales is not None:
             # Expected: weight is fp8 K×N tensor (transpose-view is fine).
             q_kn = weight.to(device=x.device)

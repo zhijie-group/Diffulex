@@ -38,12 +38,6 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
         super().__init__()
         # Cache: id(weight) -> (qweight_int8 [N,K], w_scales_fp32 [N])
         self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self._ops_available: bool = bool(
-            _vllm_ops is not None
-            and hasattr(torch.ops, "_C")
-            and hasattr(torch.ops._C, "dynamic_scaled_int8_quant")
-            and hasattr(torch.ops._C, "cutlass_scaled_mm")
-        )
 
     @property
     def name(self) -> str:
@@ -115,44 +109,13 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
         out_features: Optional[int] = None,
     ) -> torch.Tensor:
         _ = quant_kind
+        if _vllm_ops is None:
+            raise RuntimeError("vLLM custom ops are required for W8A8 (scaled_int8_quant / cutlass_scaled_mm).")
 
-        # ---- Fast path (decode hot path) ----
-        # Preconditions are strict to minimize Python overhead.
-        # Expect:
-        # - qweight: int8 KxN with stride(0)==1
-        # - w_scales: float32 [1,N], contiguous
-        if (
-            self._ops_available
-            and _vllm_ops is not None
-            and x.dim() == 2
-            and x.device.type == "cuda"
-            and x.dtype in (torch.bfloat16, torch.float16)
-            and x.is_contiguous()
-            and weight is not None
-            and weight.dtype == torch.int8
-            and weight.device == x.device
-            and weight.stride(0) == 1
-            and quant_scales is not None
-            and quant_scales.device == x.device
-            and quant_scales.dtype == torch.float32
-            and quant_scales.dim() == 2
-            and quant_scales.is_contiguous()
-        ):
-            m, _k = x.shape
-            # Optionally validate N to catch wrong metadata early.
-            if out_features is None or int(out_features) == int(quant_scales.shape[1]):
-                x_q = torch.empty((m, _k), device=x.device, dtype=torch.int8)
-                x_s = torch.empty((m, 1), device=x.device, dtype=torch.float32)
-                torch.ops._C.dynamic_scaled_int8_quant(x_q, x, x_s, None)
-                out = torch.empty((m, int(quant_scales.shape[1])), device=x.device, dtype=x.dtype)
-                torch.ops._C.cutlass_scaled_mm(out, x_q, weight, x_s, quant_scales, bias)
-                return out
-
-        # If weight already quantized by LinearBase.load-time quantization.
+        # Weight/scales: prefer load-time quantized buffers.
         if weight is not None and weight.dtype == torch.int8 and quant_scales is not None:
-            # Expected: qweight is K×N int8 (may be non-contiguous), quant_scales is [1,N] fp32
             qweight = weight
-            w_scales = quant_scales.to(dtype=torch.float32)
+            w_scales = quant_scales
         else:
             wid = id(weight)
             cached = self._weight_cache.get(wid)
@@ -164,13 +127,15 @@ class LinearInt8W8A8Strategy(LinearQuantizationStrategy):
             else:
                 qweight, w_scales = cached
 
-        # Flatten like torch.nn.functional.linear
         orig_shape = x.shape
         x2 = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
         if x2.dtype not in (torch.bfloat16, torch.float16):
             x2 = x2.to(torch.bfloat16)
-        # dynamic per-token int8 quant + fused GEMM_DQ
-        x_q, x_s, _ = _vllm_ops.scaled_int8_quant(x2.contiguous(), scale=None, azp=None, symmetric=True)
+        if not x2.is_contiguous():
+            x2 = x2.contiguous()
+
+        # dynamic per-token int8 quant + fused GEMM+dequant
+        x_q, x_s, _ = _vllm_ops.scaled_int8_quant(x2, scale=None, azp=None, symmetric=True)
         y = _vllm_ops.cutlass_scaled_mm(
             x_q,
             qweight,

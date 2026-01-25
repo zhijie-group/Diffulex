@@ -112,65 +112,34 @@ class LinearGPTQW4A16Strategy(LinearQuantizationStrategy):
                 raise RuntimeError("GPTQ offline weights missing packed tensors and bf16 weight is not present.")
             return F.linear(x, weight, bias)
 
+        if weight_bits <= 0:
+            raise RuntimeError("GPTQ requires explicit weight_bits (>0) for the CUDA kernel path.")
+
         # vLLM GPTQ kernels expect FP16 activations.
         x_in = x if x.dtype == torch.float16 else x.to(dtype=torch.float16)
+        x2 = x_in.reshape(-1, x_in.shape[-1]) if x_in.dim() != 2 else x_in
+        if not x2.is_contiguous():
+            x2 = x2.contiguous()
 
-        # ---- Fast path ----
-        if (
-            x_in.dim() == 2
-            and x_in.is_contiguous()
-            and qweight.device == x.device
-            and qzeros.device == x.device
-            and scales.device == x.device
-            and qweight.dtype == torch.int32
-            and qzeros.dtype == torch.int32
-            and scales.dtype == torch.float16
-            and qweight.is_contiguous()
-            and qzeros.is_contiguous()
-            and scales.is_contiguous()
-            and weight_bits > 0
-        ):
-            if g_idx is None or (isinstance(g_idx, torch.Tensor) and g_idx.numel() == 0):
-                g_idx_t = torch.empty((0,), device=x.device, dtype=torch.int)
-            else:
-                # Prefer already-correct dtype/device to avoid per-call copies.
-                g_idx_t = g_idx if (g_idx.device == x.device and g_idx.dtype == torch.int) else g_idx.to(device=x.device, dtype=torch.int)
-            n = int(out_features) if out_features is not None else int(qweight.shape[-1])
-            output = torch.ops._C.gptq_gemm(
-                x_in,
-                qweight,
-                qzeros,
-                scales,
-                g_idx_t,
-                True,
-                bool(use_v2_format),
-                int(weight_bits),
-            )
-            if bias is not None:
-                output.add_(bias.to(dtype=output.dtype))
-            # Output is [M,N]
-            return output.to(dtype=x.dtype) if output.dtype != x.dtype else output
-
-        out_shape = x.shape[:-1] + (int(out_features) if out_features is not None else int(qweight.shape[-1]),)
-        reshaped_x = x_in.reshape(-1, x_in.shape[-1])
-        if g_idx is None or (isinstance(g_idx, torch.Tensor) and g_idx.numel() == 0):
+        if g_idx is None or g_idx.numel() == 0:
             g_idx_t = torch.empty((0,), device=x.device, dtype=torch.int)
         else:
-            g_idx_t = g_idx.to(device=x.device, dtype=torch.int)
+            g_idx_t = g_idx if (g_idx.device == x.device and g_idx.dtype == torch.int) else g_idx.to(device=x.device, dtype=torch.int)
 
-        output = ops.gptq_gemm(
-            reshaped_x,
+        output = torch.ops._C.gptq_gemm(
+            x2,
             qweight,
             qzeros,
             scales,
             g_idx_t,
             True,  # use_exllama
             bool(use_v2_format),
-            int(weight_bits) if weight_bits > 0 else 4,
+            int(weight_bits),
         )
         if bias is not None:
             output.add_(bias.to(dtype=output.dtype))
+
+        out_shape = x.shape[:-1] + (int(out_features) if out_features is not None else int(qweight.shape[-1]),)
         output = output.reshape(out_shape)
-        # Keep output dtype consistent with input activations for downstream layers.
         return output.to(dtype=x.dtype) if output.dtype != x.dtype else output
 

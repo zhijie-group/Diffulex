@@ -35,15 +35,6 @@ def _allspark_is_available() -> bool:
         and hasattr(_vllm_ops, "allspark_repack_weight")
     )
 
-
-def _allspark_w8a16_gemm(*args, **kwargs):
-    if _vllm_ops is None or not hasattr(_vllm_ops, "allspark_w8a16_gemm"):
-        raise RuntimeError("vLLM custom ops are unavailable: missing `allspark_w8a16_gemm`.")
-    # Narrow profiler range to isolate Python wrapper overhead vs kernel time.
-    with torch.profiler.record_function("w8a16/allspark_w8a16_gemm(pybind)"):
-        return _vllm_ops.allspark_w8a16_gemm(*args, **kwargs)
-
-
 def _allspark_repack_weight(b_qweight_kn: torch.Tensor, scales_1xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Repack KxN uint8 qweight + 1xN scales into (N_32,K) + (1,N_32) for AllSpark GEMM."""
     if _vllm_ops is None or not hasattr(_vllm_ops, "allspark_repack_weight"):
@@ -262,158 +253,76 @@ class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
         out_features: Optional[int] = None,
     ) -> torch.Tensor:
         _ = quant_kind
-
-        # ---- Fast path (decode hot path) ----
-        # Goal: make Python-side overhead close to a single custom-op call (+ optional bias add).
-        # Preconditions are intentionally strict; otherwise we fall back to the fully-checked path.
-        #
-        # Notes:
-        # - We call `_vllm_ops.allspark_w8a16_gemm` directly to avoid extra Python wrapper overhead.
-        # - We require `quant_scales` already in 1xN contiguous layout (LinearBase provides this).
-        if (
-            self._allspark_available
-            and _vllm_ops is not None
-            and x.dim() == 2
-            and x.device.type == "cuda"
-            and x.dtype == torch.bfloat16
-            and x.is_contiguous()
-            and weight is not None
-            and weight.dtype in (torch.uint8, torch.int8)
-            and weight.is_contiguous()
-            and quant_scales is not None
-            and quant_scales.dim() == 2
-            and quant_scales.is_contiguous()
-            and out_features is not None
-        ):
-            # Minimal shape checks (avoid slow/branchy fallback).
-            m, k = x.shape
-            n_32, k_w = weight.shape
-            if k_w == k and (k & 15) == 0 and 0 < int(out_features) <= int(n_32):
-                sm_count, sm_version = self._get_sm_info(x.device)
-                y = _vllm_ops.allspark_w8a16_gemm(
-                    x,
-                    weight,
-                    quant_scales,
-                    None,  # b_qzeros
-                    int(out_features),
-                    -1,  # group_size (only supports -1)
-                    sm_count,
-                    sm_version,
-                    self._cublas_m_thr,
-                    False,  # has_zp
-                    True,  # n32k16_reorder
-                )
-                if bias is not None:
-                    y = y + bias
-                return y
-
-        # Handle >2D like torch.nn.functional.linear: flatten then reshape back.
-        with torch.profiler.record_function("w8a16/reshape_input"):
-            orig_shape = x.shape
-            if x.dim() == 1:
-                x2 = x.unsqueeze(0)
-            elif x.dim() == 2:
-                x2 = x
-            else:
-                x2 = x.reshape(-1, x.shape[-1])
-
-        # Load-time quantized module path: weight is uint8/int8 buffer and scales provided.
-        with torch.profiler.record_function("w8a16/select_qweight_scales"):
-            if weight is not None and weight.dtype in (torch.uint8, torch.int8):
-                if quant_scales is None:
-                    raise ValueError("quant_scales is required when weight is quantized")
-                qweight = weight
-                scales = quant_scales
-            else:
-                # Lazy cache for bf16 weights (not expected in steady-state, but keep for safety).
-                weight_id = id(weight)
-                cached = self._weight_cache.get(weight_id)
-                if cached is None or cached[0].device != x2.device:
-                    qweight, scales = self.quantize_weight_for_kernel(weight, device=x2.device)
-                    self._weight_cache[weight_id] = (qweight, scales)
-                else:
-                    qweight, scales = cached
-
-        # If fused kernel isn't available, fall back to BF16 only if original weight exists;
-        # otherwise fail fast (do NOT dequantize a full matrix, which is memory-prohibitive).
-        if not self._allspark_available:
+        if not self._allspark_available or _vllm_ops is None:
+            # correctness fallback only when bf16 weight exists
             if weight is not None and getattr(weight, "dtype", None) in (torch.float16, torch.bfloat16):
                 return F.linear(x, weight, bias)
             raise RuntimeError(
-                "vLLM AllSpark W8A16 fused kernel is unavailable, and bf16 weight is not present. "
+                "vLLM AllSpark W8A16 fused kernel is unavailable. "
                 "Please ensure vLLM custom ops are installed and loadable (`import vllm._custom_ops`)."
             )
 
-        # AllSpark kernel requires CUDA and contiguous inputs.
-        with torch.profiler.record_function("w8a16/device_dtype_checks"):
-            if x2.device.type != "cuda":
-                return self._fallback(x, weight, qweight, scales, bias)
+        orig_shape = x.shape
+        x2 = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
+        if x2.device.type != "cuda":
+            if weight is not None and getattr(weight, "dtype", None) in (torch.float16, torch.bfloat16):
+                return F.linear(x, weight, bias)
+            raise RuntimeError("AllSpark W8A16 requires CUDA inputs.")
 
-            if x2.dtype != torch.bfloat16:
-                x2 = x2.to(dtype=torch.bfloat16)
+        if x2.dtype != torch.bfloat16:
+            x2 = x2.to(dtype=torch.bfloat16)
+        if not x2.is_contiguous():
+            x2 = x2.contiguous()
 
-        # Shape checks: x2 [M,K], qweight [N_32align,K]
-        with torch.profiler.record_function("w8a16/shape_checks"):
-            m, k = x2.shape
-            n_32, k_w = qweight.shape
-            if k_w != k:
-                return self._fallback(x, weight, qweight, scales, bias)
-            if k % 16 != 0:
-                return self._fallback(x, weight, qweight, scales, bias)
-
-        # Recover real N from module bias/metadata if available; default to n_32.
-        # In Diffulex, LinearBase stores output_size; but strategy doesn't receive module.
-        # So we infer N from bias if present else from scales length (can be N_32align).
-        with torch.profiler.record_function("w8a16/infer_n_and_sm"):
-            if out_features is not None:
-                n = int(out_features)
+        # Load-time quantized module path: weight is uint8/int8 buffer and scales provided.
+        if weight is not None and weight.dtype in (torch.uint8, torch.int8):
+            if quant_scales is None:
+                raise ValueError("quant_scales is required when weight is quantized")
+            qweight = weight
+            scales = quant_scales
+        else:
+            # Safety net for bf16 weights (should be rare in steady-state).
+            weight_id = id(weight)
+            cached = self._weight_cache.get(weight_id)
+            if cached is None or cached[0].device != x2.device:
+                qweight, scales = self.quantize_weight_for_kernel(weight, device=x2.device)
+                self._weight_cache[weight_id] = (qweight, scales)
             else:
-                # Backward compatible fallback.
-                n = int(bias.numel()) if bias is not None else int(min(scales.numel(), n_32))
-            if n <= 0 or n > n_32:
-                n = n_32
+                qweight, scales = cached
 
-            sm_count, sm_version = self._get_sm_info(x2.device)
-            cublas_thr = self._cublas_m_thr
+        m, k = x2.shape
+        n_32, k_w = qweight.shape
+        if k_w != k or (k & 15) != 0:
+            if weight is not None and getattr(weight, "dtype", None) in (torch.float16, torch.bfloat16):
+                y = F.linear(x, weight, bias)
+                return y
+            raise RuntimeError(f"AllSpark W8A16 requires K%16==0 and matching K. Got x.K={k}, w.K={k_w}.")
 
-        # vLLM allspark expects scales as 1xN (or equivalent contiguous view).
-        # NOTE: reshape/view doesn't allocate; only materialize contiguous copies when needed.
-        with torch.profiler.record_function("w8a16/prepare_contiguous_and_scales"):
-            if not x2.is_contiguous():
-                x2 = x2.contiguous()
-            # qweight/scales are made contiguous at load-time (`LinearBase.set_quantized_weight`)
-            # and by `quantize_weight_for_kernel` return values.
-            if scales.dim() == 2:
-                scales_1xn = scales
-            else:
-                scales_1xn = scales.view(1, -1)
+        n = int(out_features) if out_features is not None else (int(bias.numel()) if bias is not None else int(min(scales.numel(), n_32)))
+        n = n_32 if (n <= 0 or n > n_32) else n
+        scales_1xn = scales if scales.dim() == 2 else scales.view(1, -1)
 
-        with torch.profiler.record_function("w8a16/call_fused_gemm"):
-            y2 = _allspark_w8a16_gemm(
-                x2,
-                qweight,
-                scales_1xn,
-                None,  # b_qzeros
-                n,
-                -1,  # group_size (only supports -1)
-                sm_count,
-                sm_version,
-                cublas_thr,
-                False,  # has_zp
-                True,  # n32k16_reorder
-            )
-            if bias is not None:
-                y2 = y2 + bias
-
-        # Reshape back
-        with torch.profiler.record_function("w8a16/reshape_output"):
-            if x.dim() == 1:
-                y = y2.squeeze(0)
-            elif x.dim() == 2:
-                y = y2
-            else:
-                y = y2.reshape(*orig_shape[:-1], y2.shape[-1])
-            return y
+        sm_count, sm_version = self._get_sm_info(x2.device)
+        y2 = _vllm_ops.allspark_w8a16_gemm(
+            x2,
+            qweight,
+            scales_1xn,
+            None,  # b_qzeros
+            n,
+            -1,  # group_size (only supports -1)
+            sm_count,
+            sm_version,
+            self._cublas_m_thr,
+            False,  # has_zp
+            True,  # n32k16_reorder
+        )
+        if bias is not None:
+            y2 = y2 + bias
+        if orig_shape == x2.shape:
+            return y2
+        if x.dim() == 1:
+            return y2.squeeze(0)
+        return y2.reshape(*orig_shape[:-1], y2.shape[-1])
 
     # NOTE: We intentionally do not provide a generic dequantize+F.linear fallback for reordered weights.
     # It materializes a full bf16 matrix and is prone to OOM on large models.

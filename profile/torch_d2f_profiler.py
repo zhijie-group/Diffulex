@@ -109,6 +109,9 @@ def main() -> None:
     # Engine settings (force single-process profiling by default)
     parser.add_argument("--tensor-parallel-size", type=int, default=1, help="建议保持 1，否则会 spawn 子进程导致采集不到 CUDA")
     parser.add_argument("--data-parallel-size", type=int, default=1)
+    # Distributed comm (avoid port conflicts with other local runs)
+    parser.add_argument("--master-addr", type=str, default="localhost")
+    parser.add_argument("--master-port", type=int, default=2333)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.30)
     parser.add_argument("--max-model-len", type=int, default=1024)
 
@@ -171,6 +174,8 @@ def main() -> None:
         enforce_eager=True,
         tensor_parallel_size=args.tensor_parallel_size,
         data_parallel_size=args.data_parallel_size,
+        master_addr=args.master_addr,
+        master_port=args.master_port,
         gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=max(1024, args.max_model_len),
