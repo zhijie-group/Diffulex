@@ -82,23 +82,13 @@ try:
 except Exception:
     pass
 
-# 自动设置 CUDA 12.2 路径（如果存在）
-_CUDA_12_2_PATH = Path("/home/lzx/cuda-12.2")
-if _CUDA_12_2_PATH.exists():
-    os.environ["CUDA_HOME"] = str(_CUDA_12_2_PATH)
-    # Some toolchains probe CUDA_PATH instead of CUDA_HOME.
-    os.environ["CUDA_PATH"] = str(_CUDA_12_2_PATH)
-    os.environ["PATH"] = f"{_CUDA_12_2_PATH}/bin:{os.environ.get('PATH', '')}"
-    os.environ["LD_LIBRARY_PATH"] = f"{_CUDA_12_2_PATH}/lib64:{os.environ.get('LD_LIBRARY_PATH', '')}"
-    os.environ["LIBRARY_PATH"] = f"{_CUDA_12_2_PATH}/lib64:{os.environ.get('LIBRARY_PATH', '')}"
-    os.environ["CPATH"] = f"{_CUDA_12_2_PATH}/include:{os.environ.get('CPATH', '')}"
-    os.environ["CUDACXX"] = str(_CUDA_12_2_PATH / "bin" / "nvcc")
-    print(f"[INFO] 已自动设置 CUDA 路径: {_CUDA_12_2_PATH}")
-
-# 设置使用 GPU1（如果 GPU0 被占用）
-if "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-    print(f"[INFO] 已设置 CUDA_VISIBLE_DEVICES=1（使用 GPU1）")
+#
+# NOTE:
+# 这个脚本不应假设本机 CUDA 安装路径或默认 GPU 号。
+# 如需指定 CUDA/设备，请在运行前自行设置：
+#   - CUDA_HOME / CUDA_PATH / PATH / LD_LIBRARY_PATH
+#   - CUDA_VISIBLE_DEVICES
+# 或者在你自己的 wrapper 脚本里处理。
 
 # 确保从当前仓库导入
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -736,7 +726,9 @@ def main():
     
     # 其他选项
     parser.add_argument('--max-tokens', type=int, default=30, help='最大生成 token 数（默认: 30）')
-    parser.add_argument('--model-path', type=str, help='模型路径（默认: 从环境变量 DIFFULEX_TEST_MODEL 读取）')
+    parser.add_argument('--model-path', type=str, required=True, help='模型路径（必填）')
+    parser.add_argument('--lora-path', type=str, default="", help='LoRA 路径（可选）')
+    parser.add_argument('--use-lora', action='store_true', help='启用 LoRA（需同时提供 --lora-path）')
     parser.add_argument('--gpu-memory-utilization', type=float, default=0.3, help='GPU 内存利用率（默认: 0.3）')
     parser.add_argument('--no-isolate', action='store_true', help='多策略运行时不使用子进程隔离（调试用，可能导致状态串扰/性能波动）')
     # Internal: emit a single JSON result line for parent process parsing.
@@ -745,10 +737,10 @@ def main():
     args = parser.parse_args()
     
     # 确定模型路径
-    model_path = args.model_path or os.getenv("DIFFULEX_TEST_MODEL", "/data1/ckpts/Dream-org/Dream-v0-Base-7B")
+    model_path = args.model_path
     if not os.path.exists(model_path):
         print(f"错误: 模型路径不存在: {model_path}")
-        print("请使用 --model-path 或设置环境变量 DIFFULEX_TEST_MODEL 指向有效的模型路径")
+        print("请使用 --model-path 指向有效的模型路径")
         return
     
     # 解析要运行的策略
@@ -786,8 +778,8 @@ def main():
     
     # 通用 Diffulex 配置
     common_kwargs = {
-        'lora_path': os.getenv("DIFFULEX_TEST_LORA", ""),
-        'use_lora': bool(os.getenv("DIFFULEX_TEST_LORA", "")),
+        'lora_path': args.lora_path,
+        'use_lora': bool(args.use_lora and args.lora_path),
         'model_name': 'dream',
         'enforce_eager': True,
         'data_parallel_size': 1,

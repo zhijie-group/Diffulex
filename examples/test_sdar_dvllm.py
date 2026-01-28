@@ -97,14 +97,14 @@ def main() -> None:
     parser.add_argument(
         "--model",
         type=str,
-        default="/home/lzx/SDAR/training/model/SDAR-1.7B-Chat",
+        required=True,
         help="SDAR HF model directory (contains config.json + model.safetensors).",
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
         "--converted-dir",
         type=str,
-        default="/home/lzx/tmp/diffulex_sdar_converted",
+        default="tmp/diffulex_sdar_converted",
         help="Output directory for converted checkpoint keys (Diffulex-native).",
     )
     parser.add_argument("--prompt", type=str, default="你好，请用一句话介绍 SDAR。")

@@ -84,6 +84,16 @@ class QuantizationStrategy(ABC):
         """
         pass
 
+    def configure(self, *, diffulex_config: Any | None = None) -> None:
+        """Optional hook to configure a strategy from Diffulex `Config`.
+
+        We intentionally keep this a no-op by default to avoid forcing configuration
+        plumbing through every call site. Strategy-specific tuning knobs should be
+        surfaced via explicit fields on `diffulex.config.Config`, not environment variables.
+        """
+        _ = diffulex_config
+        return
+
     # ---- Optional capability flags / helpers (non-abstract) ----
     # These helpers are used to avoid hard-coding isinstance(...) checks in the runtime.
     @property

@@ -115,12 +115,10 @@ class DPEngine:
         need_gpus = self.dp_size * cfg.tensor_parallel_size
         assert len(vis) >= need_gpus, f"Require {need_gpus} GPUs (dp={self.dp_size}, tp={cfg.tensor_parallel_size}), visible {len(vis)}"
 
-        # Optional overrides: kwargs['device_ids'] or env D2F_DEVICE_MAP
+        # Optional overrides: kwargs['device_ids']
         override = None
         if 'device_ids' in kwargs and kwargs['device_ids']:
             override = list(kwargs['device_ids'])
-        elif os.environ.get('D2F_DEVICE_MAP'):
-            override = [int(x) for x in os.environ['D2F_DEVICE_MAP'].split(',') if x.strip() != '']
         if override is not None:
             assert len(override) >= need_gpus, f"device_ids length {len(override)} < required {need_gpus}"
             # All override devices must be in visible list

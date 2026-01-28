@@ -13,7 +13,6 @@ Important:
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional
 
 import torch
@@ -62,9 +61,25 @@ class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
         self._weight_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # Cache device info and thresholds to reduce per-call CPU overhead.
         self._sm_info_cache: dict[int, tuple[int, int]] = {}
-        self._cublas_m_thr: int = self._cublas_m_threshold()
+        self._quant_block_n: int = 256
+        self._cublas_m_thr: int = 256
         # One-time availability check (avoid calling `_allspark_is_available()` on every linear).
         self._allspark_available: bool = _allspark_is_available()
+
+    def configure(self, *, diffulex_config: Any | None = None) -> None:
+        # Prefer explicit config fields over environment-variable based tuning.
+        if diffulex_config is None:
+            return
+        try:
+            bn = int(getattr(diffulex_config, "linear_w8a16_quant_block_n", self._quant_block_n))
+            self._quant_block_n = max(1, bn)
+        except Exception:
+            pass
+        try:
+            thr = int(getattr(diffulex_config, "linear_w8a16_allspark_cublas_m_threshold", self._cublas_m_thr))
+            self._cublas_m_thr = max(1, thr)
+        except Exception:
+            pass
 
     @property
     def name(self) -> str:
@@ -158,11 +173,7 @@ class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
         # Avoid allocating a full [N,K] fp32 copy (and an extra transpose buffer).
         # Quantize in small row blocks and (when using AllSpark) write directly into
         # the repack input layout B_kn=[K,N], so we never materialize q_u8 + transpose.
-        try:
-            block_n = int(os.getenv("DIFFULEX_W8A16_QUANT_BLOCK_N", "256"))
-        except Exception:
-            block_n = 256
-        block_n = max(1, block_n)
+        block_n = max(1, int(self._quant_block_n))
 
         if self._allspark_available:
             # AllSpark repack expects B in (K,N) contiguous layout.
@@ -233,14 +244,6 @@ class LinearMarlinInt8W8A16Strategy(LinearQuantizationStrategy):
         except Exception:
             self._sm_info_cache[idx] = (0, 0)
             return 0, 0
-
-    def _cublas_m_threshold(self) -> int:
-        # For decode, M is typically small, so AllSpark custom kernel is preferred.
-        # For large-M prefill, AllSpark falls back to a dequant+cuBLAS path if M > threshold.
-        try:
-            return int(os.getenv("DIFFULEX_ALLSPARK_CUBLAS_M_THRESHOLD", "256"))
-        except Exception:
-            return 256
 
     def linear_forward(
         self,

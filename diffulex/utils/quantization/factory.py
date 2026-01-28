@@ -60,6 +60,7 @@ class QuantizationStrategyFactory:
         
         # KV Cache strategy
         strategy = QuantizationStrategyFactory.create_kv_cache_strategy(quant_cfg.kv_cache.dtype)
+        strategy.configure(diffulex_config=config)
         ctx.set_strategy('kv_cache', strategy)
 
         # Linear strategies (weights + activations) by kind
@@ -67,12 +68,14 @@ class QuantizationStrategyFactory:
             weight_dtype=quant_cfg.weights.linear_attn_dtype,
             act_dtype=quant_cfg.activations.linear_attn_dtype,
         )
+        linear_attn.configure(diffulex_config=config)
         ctx.set_linear_strategy("attn", linear_attn)
 
         linear_mlp = _create_linear_strategy(
             weight_dtype=quant_cfg.weights.linear_mlp_dtype,
             act_dtype=quant_cfg.activations.linear_mlp_dtype,
         )
+        linear_mlp.configure(diffulex_config=config)
         ctx.set_linear_strategy("mlp", linear_mlp)
         
         # Future: Weight strategy

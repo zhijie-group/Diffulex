@@ -84,4 +84,5 @@ if __name__ == "__main__":
           "=*=" * 30)
     for idx, o in enumerate(outputs):
         print("\n", "=*=" * 30)
-        print(f"[Prompt {idx} Result] \n{prompts[idx] + "\n-----<Start-of-Response>-----\n" + o['text']}\n")
+        resp = prompts[idx] + "\n-----<Start-of-Response>-----\n" + o["text"]
+        print(f"[Prompt {idx} Result]\n{resp}\n")

@@ -32,8 +32,7 @@ class Config:
     # Distributed comm (per tensor-parallel group). When using multiple DP
     # replicas on one host, assign unique master_port per replica.
     master_addr: str = "localhost"
-    # Allow overriding to avoid port collisions in multi-run/CI environments.
-    master_port: int = int(os.environ.get("DIFFULEX_MASTER_PORT", "2333"))
+    master_port: int = 2333
     # Shared memory segment name for intra-TP RPC; must be unique per DP group.
     shm_name: str = "diffulex_shm"
     # Start device index for this TP group (set by DP launcher).
@@ -59,6 +58,11 @@ class Config:
     linear_mlp_weight_dtype: str = "bf16"
     linear_attn_act_dtype: str = "bf16"
     linear_mlp_act_dtype: str = "bf16"
+
+    # Kernel tuning knobs (avoid environment-variable based tuning in library code).
+    # Currently used by some W8A16 linear strategies.
+    linear_w8a16_quant_block_n: int = 256
+    linear_w8a16_allspark_cublas_m_threshold: int = 256
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

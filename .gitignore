@@ -54,5 +54,6 @@ GITHUB_ISSUE.md
 Tilelang-failed_test_cases/
 # Benchmark results
 benchmark_results/
+benchmark_results_tmp/
 # Cursor IDE files
 .cursor/

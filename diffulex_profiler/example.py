@@ -67,7 +67,16 @@ def example_multiple_sections():
     
     # Profile model loading
     with profiler.profile("model_loading"):
-        llm = Diffulex(model_path, model_name="dream", ...)
+        model_path = "/path/to/your/model"
+        llm = Diffulex(
+            model_path,
+            model_name="dream",
+            tensor_parallel_size=1,
+            data_parallel_size=1,
+            gpu_memory_utilization=0.25,
+            max_model_len=2048,
+            decoding_strategy="d2f",
+        )
     
     # Profile prefill
     prompts = ["Prompt 1", "Prompt 2"]

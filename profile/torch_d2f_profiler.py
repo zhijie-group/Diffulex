@@ -40,17 +40,6 @@ try:
 except Exception:
     pass
 
-# Optional: auto CUDA 12.2 toolchain env (align with your other scripts).
-_CUDA_12_2_PATH = Path("/home/lzx/cuda-12.2")
-if _CUDA_12_2_PATH.exists():
-    os.environ.setdefault("CUDA_HOME", str(_CUDA_12_2_PATH))
-    os.environ.setdefault("CUDA_PATH", str(_CUDA_12_2_PATH))
-    os.environ["PATH"] = f"{_CUDA_12_2_PATH}/bin:{os.environ.get('PATH', '')}"
-    os.environ["LD_LIBRARY_PATH"] = f"{_CUDA_12_2_PATH}/lib64:{os.environ.get('LD_LIBRARY_PATH', '')}"
-    os.environ["LIBRARY_PATH"] = f"{_CUDA_12_2_PATH}/lib64:{os.environ.get('LIBRARY_PATH', '')}"
-    os.environ["CPATH"] = f"{_CUDA_12_2_PATH}/include:{os.environ.get('CPATH', '')}"
-    os.environ.setdefault("CUDACXX", str(_CUDA_12_2_PATH / "bin" / "nvcc"))
-
 # Ensure import from current repo.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -89,9 +78,10 @@ def _mkdir(p: Path) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser("Diffulex torch.profiler flamegraph (D2F/Dream)")
 
-    parser.add_argument("--model-path", type=str, default=os.getenv("DIFFULEX_TEST_MODEL", "/data1/ckpts/Dream-org/Dream-v0-Base-7B"))
-    parser.add_argument("--lora-path", type=str, default=os.getenv("DIFFULEX_TEST_LORA", ""))
-    parser.add_argument("--use-lora", action="store_true", help="启用 LoRA（需同时提供 --lora-path 或 DIFFULEX_TEST_LORA）")
+    parser.add_argument("--model-path", type=str, required=True, help="模型路径（必填）")
+    parser.add_argument("--lora-path", type=str, default="", help="LoRA 路径（可选）")
+    parser.add_argument("--use-lora", action="store_true", help="启用 LoRA（需同时提供 --lora-path）")
+    parser.add_argument("--cuda-home", type=str, default="", help="（可选）设置 CUDA_HOME/CUDA_PATH 并更新 PATH/LD_LIBRARY_PATH")
 
     parser.add_argument("--tag", type=str, default="torch_profile", help="输出文件名前缀")
     parser.add_argument("--out-dir", type=str, default="log/torch_profiles", help="输出目录（相对仓库根）")
@@ -151,6 +141,18 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.cuda_home:
+        cuda_home = Path(args.cuda_home)
+        if not cuda_home.exists():
+            raise FileNotFoundError(f"--cuda-home 不存在: {cuda_home}")
+        os.environ["CUDA_HOME"] = str(cuda_home)
+        os.environ["CUDA_PATH"] = str(cuda_home)
+        os.environ["PATH"] = f"{cuda_home}/bin:{os.environ.get('PATH', '')}"
+        os.environ["LD_LIBRARY_PATH"] = f"{cuda_home}/lib64:{os.environ.get('LD_LIBRARY_PATH', '')}"
+        os.environ["LIBRARY_PATH"] = f"{cuda_home}/lib64:{os.environ.get('LIBRARY_PATH', '')}"
+        os.environ["CPATH"] = f"{cuda_home}/include:{os.environ.get('CPATH', '')}"
+        os.environ["CUDACXX"] = str(cuda_home / "bin" / "nvcc")
 
     model_path = Path(args.model_path)
     if not model_path.exists():

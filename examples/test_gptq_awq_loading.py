@@ -25,23 +25,6 @@ try:
 except Exception:
     pass
 
-# 自动设置 CUDA 12.2 路径（如果存在）
-_CUDA_12_2_PATH = Path("/home/lzx/cuda-12.2")
-if _CUDA_12_2_PATH.exists():
-    os.environ["CUDA_HOME"] = str(_CUDA_12_2_PATH)
-    os.environ["CUDA_PATH"] = str(_CUDA_12_2_PATH)
-    os.environ["PATH"] = f"{_CUDA_12_2_PATH}/bin:{os.environ.get('PATH', '')}"
-    os.environ["LD_LIBRARY_PATH"] = f"{_CUDA_12_2_PATH}/lib64:{os.environ.get('LD_LIBRARY_PATH', '')}"
-    os.environ["LIBRARY_PATH"] = f"{_CUDA_12_2_PATH}/lib64:{os.environ.get('LIBRARY_PATH', '')}"
-    os.environ["CPATH"] = f"{_CUDA_12_2_PATH}/include:{os.environ.get('CPATH', '')}"
-    os.environ["CUDACXX"] = str(_CUDA_12_2_PATH / "bin" / "nvcc")
-    print(f"[INFO] 已自动设置 CUDA 路径: {_CUDA_12_2_PATH}")
-
-# 设置使用 GPU1（如果 GPU0 被占用）
-if "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-    print(f"[INFO] 已设置 CUDA_VISIBLE_DEVICES=1（使用 GPU1）")
-
 # 确保从当前仓库导入
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
